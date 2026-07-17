@@ -7,3 +7,4 @@ asyncpg
 alembic
 pydantic-settings
 python-dotenv
+httpx
