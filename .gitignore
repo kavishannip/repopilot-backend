@@ -1,0 +1,20 @@
+.agents/
+backend_Implementation_plan/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# Database / local logs
+*.log

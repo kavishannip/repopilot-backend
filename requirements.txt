@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+langchain
+langchain-groq
+sqlalchemy[asyncio]
+asyncpg
+alembic
+pydantic-settings
+python-dotenv
