@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     github_token: str = ""
     database_url: str = ""
+    nvidia_api_key: str = ""
     # Optional ones
     supabase_url: str = ""
     supabase_key: str = ""
