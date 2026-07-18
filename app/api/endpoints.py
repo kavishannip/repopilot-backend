@@ -50,19 +50,31 @@ async def analyze_repo(req: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch repo metadata: {str(e)}")
 
-    # 2. Check cache for brief (must match commit_sha)
+    # 2. Check cache for brief (must match commit_sha and not be expired)
     async with async_session() as session:
         stmt = select(Repository).where(Repository.repo_url == repo_url)
         result = await session.execute(stmt)
         repo_obj = result.scalar_one_or_none()
 
-        if repo_obj and repo_obj.commit_sha == commit_sha and repo_obj.brief:
-            brief = RepoBrief(**repo_obj.brief)
-            return AnalyzeResponse(
-                status="success",
-                message="Returned from cache",
-                data=brief,
-            )
+        if repo_obj:
+            from datetime import datetime
+            
+            # Check if cache is expired
+            now = datetime.utcnow()
+            expire_days = settings.repo_cache_expire_days
+            
+            if repo_obj.updated_at and (now - repo_obj.updated_at).days >= expire_days:
+                # Cache expired -> delete it from DB and proceed to analyze fresh
+                await session.delete(repo_obj)
+                await session.commit()
+            elif repo_obj.commit_sha == commit_sha and repo_obj.brief:
+                # Valid cache hit
+                brief = RepoBrief(**repo_obj.brief)
+                return AnalyzeResponse(
+                    status="success",
+                    message="Returned from cache",
+                    data=brief,
+                )
 
     # 3. Full multi-pass analysis
     try:
