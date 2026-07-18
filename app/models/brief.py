@@ -23,7 +23,7 @@ class TechItem(BaseModel):
     purpose: str = Field(description="What role this technology plays in the project")
 
 
-class RepoBrief(BaseModel):
+class LLMRepoBrief(BaseModel):
     # Core fields
     tech_stack: List[TechItem] = Field(
         description="List of main technologies with versions and categories"
@@ -52,13 +52,18 @@ class RepoBrief(BaseModel):
         description="Architectural/design patterns detected: e.g. 'MVC', 'REST API', 'PWA', 'Server-Side Rendering', 'Event-driven', 'Monorepo'"
     )
 
-    # Rich metadata
+    dependency_graph: Dict[str, List[str]] = Field(
+        description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
+    )
+
+
+class RepoBrief(LLMRepoBrief):
+    """
+    Final output schema including statically generated fields.
+    """
     framework_details: Dict[str, str] = Field(
         description="Detected frameworks and tools with versions: {'Next.js': '15.x', 'React': '18.x'}"
     )
     directory_structure: str = Field(
         description="ASCII tree showing project directory structure (top 3-4 levels)"
-    )
-    dependency_graph: Dict[str, List[str]] = Field(
-        description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
     )

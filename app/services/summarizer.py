@@ -25,7 +25,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from app.models.brief import RepoBrief, ComponentInfo, TechItem, FileReference
+from app.models.brief import RepoBrief, LLMRepoBrief, ComponentInfo, TechItem, FileReference
 from app.services.llm import get_fast_llm, get_reasoning_llm
 from app.services.pipeline import ProcessingPipeline
 from app.services.repo_map import RepoMap
@@ -214,7 +214,7 @@ class RepoSummarizer:
         self.fast_llm = get_fast_llm()
         # Phase 4: NVIDIA NIM (reasoning, structured output)
         self.reasoning_llm = get_reasoning_llm()
-        self.reasoning_llm_structured = get_reasoning_llm().with_structured_output(RepoBrief)
+        self.reasoning_llm_structured = get_reasoning_llm().with_structured_output(LLMRepoBrief)
         self.pipeline = ProcessingPipeline()
         self.repo_map_builder = RepoMap()
         self.github = GitHubClient()
@@ -622,7 +622,7 @@ STRICT RULES:
 - Dependencies: use the STATIC ANALYSIS section for declared vs. used. Do not guess from manifest alone.
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
-- Do NOT invent components not evidenced in context. Do NOT hallucinate.
+- STRICT ANTI-HALLUCINATION RULE: You must ONLY use information explicitly present in the provided context. If the context does not contain enough information to accurately populate a field, you MUST output 'Not available' (for strings) or an empty list/object (for arrays/dicts). Do NOT guess, infer, or fabricate any details, names, or versions.
 - If uncertain, say so in flagged_issues."""
 
         user_prompt = f"""Repository: {repo_url}
@@ -673,13 +673,14 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
         duration = time.time() - t_start
         print(f"  [Pass 4] NVIDIA synthesis: {duration:.1f}s")
 
-        # Post-process: fallback populate from our own detection if LLM left empty
-        if not brief.directory_structure:
-            brief.directory_structure = ascii_tree[:2000]
-        if not brief.framework_details:
-            brief.framework_details = detected_frameworks
+        # Convert LLMRepoBrief to full RepoBrief, injecting static analysis
+        final_brief = RepoBrief(
+            **brief.model_dump(),
+            directory_structure=ascii_tree[:2000],
+            framework_details=detected_frameworks,
+        )
 
-        return brief
+        return final_brief
 
     # ─────────────────────────────────────────────────────────
     # Lite brief fallback (Phase 4 failed)
