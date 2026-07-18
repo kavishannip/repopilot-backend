@@ -20,8 +20,13 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 16384   # output token cap (generous for rich structured JSON)
     llm_context_chars: int = 60_000  # total input context chars to feed final synthesis
 
+    # ── Groq (Phase 3 group summaries) ──────────────────────
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.1-8b-instant"    # swap via GROQ_MODEL env var to experiment
+    # Semaphore limit for Phase 3 parallel calls — tuned for Groq free-tier ~6K TPM
+    phase3_concurrency: int = 2
+
     # ── Unused (Groq replaced by NVIDIA NIM) ─────────────────
-    groq_api_key: str = ""         # no longer used for LLM calls
     supabase_url: str = ""
     supabase_key: str = ""
 

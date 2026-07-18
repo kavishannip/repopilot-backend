@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import re
+import asyncio
+import logging
 from typing import Optional
 
 from app.database import async_session
@@ -9,10 +11,12 @@ from app.models.schema import Repository
 from app.services.summarizer import RepoSummarizer
 from app.models.brief import RepoBrief
 from app.services.github_client import RepoSizeExceededError
+from app.services.job_manager import job_manager
 from app.config import settings
 
 router = APIRouter()
 summarizer = RepoSummarizer()
+logger = logging.getLogger(__name__)
 
 
 class AnalyzeRequest(BaseModel):
@@ -25,32 +29,68 @@ class AnalyzeResponse(BaseModel):
     data: Optional[RepoBrief] = None
 
 
+class JobSubmitResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str           # pending|running|completed|failed
+    phase: str            # queued|embedding|structural_map|search|group_summaries|synthesis|done|failed
+    result: Optional[RepoBrief] = None
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
 def is_valid_github_url(url: str) -> bool:
     pattern = r"^https://github\.com/[\w-]+/[\w.-]+/?$"
     return bool(re.match(pattern, url))
 
 
-@router.post("/analyze", response_model=AnalyzeResponse)
+async def _run_pipeline(job_id: str, repo_url: str) -> None:
+    """
+    Background task: runs full analysis pipeline, writes result/error to DB job row.
+    Designed to be fire-and-forget via asyncio.create_task().
+    """
+    try:
+        brief = await summarizer.generate_brief(repo_url, job_id=job_id)
+        await job_manager.complete_job(job_id, brief.model_dump())
+    except RepoSizeExceededError as e:
+        await job_manager.fail_job(job_id, f"Repo too large: {e}")
+    except Exception as e:
+        logger.exception(f"[Job {job_id[:8]}] pipeline error")
+        await job_manager.fail_job(job_id, str(e))
+
+
+@router.post("/analyze", response_model=JobSubmitResponse)
 async def analyze_repo(req: AnalyzeRequest):
+    """
+    Submit a repo for analysis. Returns a job_id immediately.
+    Poll GET /status/{job_id} for progress and result.
+
+    If the repo brief is already cached (same commit SHA, not expired), returns
+    the brief directly in the 'result' field of the status endpoint without
+    creating a job.
+    """
     repo_url = req.repo_url.rstrip("/")
 
     if not is_valid_github_url(repo_url):
         raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
 
-    # 1. Fetch metadata first to get commit sha
+    # 1. Validate repo + get commit SHA (fast, synchronous-ish)
     try:
         meta = await summarizer.github.get_repo_metadata(repo_url)
         branch = meta["default_branch"]
         commit_sha = await summarizer.pipeline._get_branch_commit(repo_url, branch)
     except RepoSizeExceededError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"This repo exceeds the current size limit. {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Repo exceeds size limit. {e}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch repo metadata: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to fetch repo metadata: {e}")
 
-    # 2. Check cache for brief (must match commit_sha and not be expired)
+    # 2. Check cache — if valid, return cached job immediately
     async with async_session() as session:
         stmt = select(Repository).where(Repository.repo_url == repo_url)
         result = await session.execute(stmt)
@@ -58,57 +98,57 @@ async def analyze_repo(req: AnalyzeRequest):
 
         if repo_obj:
             from datetime import datetime
-            
-            # Check if cache is expired
             now = datetime.utcnow()
             expire_days = settings.repo_cache_expire_days
-            
+
             if repo_obj.updated_at and (now - repo_obj.updated_at).days >= expire_days:
-                # Cache expired -> delete it from DB and proceed to analyze fresh
+                # Expired — delete and fall through to fresh analysis
                 await session.delete(repo_obj)
                 await session.commit()
             elif repo_obj.commit_sha == commit_sha and repo_obj.brief:
-                # Valid cache hit
-                brief = RepoBrief(**repo_obj.brief)
-                return AnalyzeResponse(
-                    status="success",
-                    message="Returned from cache",
-                    data=brief,
+                # Cache hit — create a synthetic completed job so the caller
+                # can use the same polling endpoint consistently
+                cached_job_id = await job_manager.create_job(repo_url)
+                await job_manager.complete_job(cached_job_id, repo_obj.brief)
+                return JobSubmitResponse(
+                    job_id=cached_job_id,
+                    status="completed",
+                    message="Returned from cache — poll /status/{job_id} for result",
                 )
 
-    # 3. Full multi-pass analysis
-    try:
-        import asyncio
-        timeout = settings.analysis_timeout_seconds
-        brief = await asyncio.wait_for(
-            summarizer.generate_brief(repo_url),
-            timeout=float(timeout),
-        )
+    # 3. Create DB job + fire background task
+    job_id = await job_manager.create_job(repo_url)
+    asyncio.create_task(_run_pipeline(job_id, repo_url))
 
-        # Cache the brief
-        async with async_session() as session:
-            stmt = select(Repository).where(Repository.repo_url == repo_url)
-            result = await session.execute(stmt)
-            repo_obj = result.scalar_one_or_none()
-            if repo_obj:
-                repo_obj.brief = brief.model_dump()
-                await session.commit()
+    return JobSubmitResponse(
+        job_id=job_id,
+        status="pending",
+        message="Analysis started. Poll GET /api/analyzer/status/{job_id} for progress.",
+    )
 
-        return AnalyzeResponse(
-            status="success",
-            message="Repository analyzed successfully",
-            data=brief,
-        )
 
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Analysis timed out after {settings.analysis_timeout_seconds}s. The repository may be too large or complex."
-        )
-    except RepoSizeExceededError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"This repo exceeds the current file limit — try a smaller repo. {str(e)}"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to analyze repository: {str(e)}")
+@router.get("/status/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """
+    Poll analysis job status. Returns phase progress and final result when done.
+    """
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    result_brief = None
+    if job["status"] == "completed" and job.get("result"):
+        try:
+            result_brief = RepoBrief(**job["result"])
+        except Exception as e:
+            logger.warning(f"Failed to parse cached brief for job {job_id}: {e}")
+
+    return JobStatusResponse(
+        job_id=job["job_id"],
+        status=job["status"],
+        phase=job["phase"],
+        result=result_brief,
+        error=job.get("error"),
+        created_at=job.get("created_at"),
+        updated_at=job.get("updated_at"),
+    )
