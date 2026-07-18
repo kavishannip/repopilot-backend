@@ -78,10 +78,21 @@ class ProcessingPipeline:
             all_chunks = []
             
             print(f"Processing {len(files)} files...")
-            for f in files:
-                content = await self.github.get_file_content(repo_url, f["path"])
-                if content:
-                    file_chunks = self.chunker.chunk_file(f["path"], content)
+            
+            async def fetch_and_chunk(f):
+                try:
+                    content = await self.github.get_file_content(repo_url, f["path"])
+                    if content:
+                        return self.chunker.chunk_file(f["path"], content)
+                except Exception as e:
+                    print(f"Failed to process {f['path']}: {e}")
+                return []
+                
+            batch_size = 30
+            for i in range(0, len(files), batch_size):
+                batch = files[i:i+batch_size]
+                results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
+                for file_chunks in results:
                     all_chunks.extend(file_chunks)
                     
             print(f"Total chunks generated: {len(all_chunks)}")
@@ -96,11 +107,21 @@ class ProcessingPipeline:
                 print("Saving to database...")
                 db_chunks = []
                 for i, c in enumerate(all_chunks):
+                    clean_text = c["text"].replace("\x00", "")
+                    
+                    # Clean metadata just in case (as it gets serialized to JSONB)
+                    clean_metadata = {}
+                    for k, v in c["metadata"].items():
+                        if isinstance(v, str):
+                            clean_metadata[k] = v.replace("\x00", "")
+                        else:
+                            clean_metadata[k] = v
+                            
                     db_chunks.append(
                         RepoChunk(
                             repository_id=repo_obj.id,
-                            chunk_text=c["text"],
-                            chunk_metadata=c["metadata"],
+                            chunk_text=clean_text,
+                            chunk_metadata=clean_metadata,
                             embedding=embeddings[i]
                         )
                     )

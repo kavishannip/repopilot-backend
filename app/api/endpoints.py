@@ -58,8 +58,8 @@ async def analyze_repo(req: AnalyzeRequest):
     # 3. Process and summarize (if not fully cached or no brief)
     try:
         import asyncio
-        # Add 90s hard timeout
-        brief = await asyncio.wait_for(summarizer.generate_brief(repo_url), timeout=90.0)
+        # Add 300s hard timeout
+        brief = await asyncio.wait_for(summarizer.generate_brief(repo_url), timeout=300.0)
         
         # Save brief to db
         async with async_session() as session:
@@ -76,7 +76,7 @@ async def analyze_repo(req: AnalyzeRequest):
             data=brief
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Analysis timed out. The repository may be too large to process within 90 seconds.")
+        raise HTTPException(status_code=504, detail="Analysis timed out. The repository may be too large to process within 300 seconds.")
     except RepoSizeExceededError as e:
         raise HTTPException(status_code=400, detail=f"This repo exceeds the current file limit. {str(e)}")
     except Exception as e:
