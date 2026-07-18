@@ -311,9 +311,13 @@ class RepoSummarizer:
         sorted_groups = sorted(groups.items(), key=lambda x: len("\n".join(x[1])), reverse=True)
         top_groups = sorted_groups[:MAX_SOURCE_GROUPS]
 
-        print(f"  Summarizing {len(top_groups)} file groups in parallel...")
+        print(f"  Summarizing {len(top_groups)} file groups (max concurrency: 3)...")
+        sem = asyncio.Semaphore(3)
 
-        async def summarize_group(group_key: str, file_texts: List[str]) -> str:
+        async def summarize_group(group_key: str, file_texts: List[str], index: int) -> str:
+            # Stagger startup to avoid instant spike even within the semaphore
+            await asyncio.sleep(index * 0.5)
+            
             context = "\n\n".join(file_texts)[:MAX_GROUP_CONTEXT_CHARS]
             prompt = ChatPromptTemplate.from_messages([
                 SystemMessage(content=(
@@ -327,15 +331,27 @@ class RepoSummarizer:
                 )),
                 HumanMessage(content=f"Directory/Group: {group_key}\n\n{context}"),
             ])
-            try:
-                result = await self.fast_llm.ainvoke(prompt.format_messages())
-                return f"[{group_key}]\n{result.content}"
-            except Exception as e:
-                print(f"  Group summary failed for '{group_key}': {e}")
-                return f"[{group_key}] (summary failed: {e})"
+            
+            async with sem:
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        result = await self.fast_llm.ainvoke(prompt.format_messages())
+                        return f"[{group_key}]\n{result.content}"
+                    except Exception as e:
+                        error_msg = str(e)
+                        if "429" in error_msg and attempt < max_retries - 1:
+                            wait_time = 2 ** (attempt + 1)
+                            print(f"  [429 Rate Limit] Group '{group_key}' retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            print(f"  Group summary failed for '{group_key}': {e}")
+                            return f"[{group_key}] (summary failed: {e})"
+                
+                return f"[{group_key}] (summary failed: max retries reached)"
 
         summaries = await asyncio.gather(
-            *(summarize_group(key, texts) for key, texts in top_groups)
+            *(summarize_group(key, texts, idx) for idx, (key, texts) in enumerate(top_groups))
         )
         print(f"  Generated {len(summaries)} group summaries")
         return list(summaries)

@@ -46,6 +46,7 @@ def get_fast_llm() -> ChatNVIDIA:
         model=settings.repo_analizer_model,
         temperature=0.0,
         max_tokens=2048,
+        timeout=60, # 1 minute timeout for fast pass
     ).with_thinking_mode(enabled=False)
 
 
@@ -59,5 +60,6 @@ def get_reasoning_llm() -> ChatNVIDIA:
         model=settings.repo_analizer_model,
         temperature=0.0,
         max_tokens=settings.llm_max_tokens,
+        timeout=300, # 5 minute timeout since thinking mode takes longer to generate
     )
     return base.with_thinking_mode(enabled=settings.llm_enable_thinking)
