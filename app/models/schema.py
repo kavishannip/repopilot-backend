@@ -1,7 +1,8 @@
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+import uuid
 from pgvector.sqlalchemy import Vector
 
 Base = declarative_base()
@@ -9,7 +10,7 @@ Base = declarative_base()
 class Repository(Base):
     __tablename__ = "repositories"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     repo_url = Column(String, unique=True, index=True, nullable=False)
     owner = Column(String, nullable=False)
     name = Column(String, nullable=False)
@@ -27,8 +28,8 @@ class Repository(Base):
 class RepoChunk(Base):
     __tablename__ = "repo_chunks"
 
-    id = Column(Integer, primary_key=True, index=True)
-    repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     chunk_text = Column(Text, nullable=False)
     embedding = Column(Vector(2048)) # Nvidia nemotron-3-embed-1b 
     chunk_metadata = Column(JSONB)

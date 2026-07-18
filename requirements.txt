@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 langchain
-langchain-groq
+langchain-nvidia-ai-endpoints
 sqlalchemy[asyncio]
 asyncpg
 alembic
