@@ -18,6 +18,7 @@ class Repository(Base):
     language = Column(String)
     stars = Column(Integer)
     description = Column(Text)
+    brief = Column(JSONB) # Cached brief
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
