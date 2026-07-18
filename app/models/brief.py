@@ -43,28 +43,22 @@ class RepoBrief(BaseModel):
 
     # Architectural detail
     components: List[ComponentInfo] = Field(
-        default_factory=list,
         description="Architectural components breakdown (frontend, backend, DB layer, etc.)"
     )
     data_flow: str = Field(
-        default="",
         description="How data flows through the system: user request → ... → response. Include key transformation steps."
     )
     detected_patterns: List[str] = Field(
-        default_factory=list,
         description="Architectural/design patterns detected: e.g. 'MVC', 'REST API', 'PWA', 'Server-Side Rendering', 'Event-driven', 'Monorepo'"
     )
 
     # Rich metadata
     framework_details: Dict[str, str] = Field(
-        default_factory=dict,
         description="Detected frameworks and tools with versions: {'Next.js': '15.x', 'React': '18.x'}"
     )
     directory_structure: str = Field(
-        default="",
         description="ASCII tree showing project directory structure (top 3-4 levels)"
     )
     dependency_graph: Dict[str, List[str]] = Field(
-        default_factory=dict,
         description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
     )

@@ -18,3 +18,6 @@ ENV/
 
 # Database / local logs
 *.log
+
+# Scripts
+scripts/delete_repo.py

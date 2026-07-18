@@ -400,12 +400,13 @@ Your task: produce a HIGHLY ACCURATE RepoBrief that could let someone draw an ar
 Rules:
 - Cite ACTUAL file paths, function names, and library versions you see in the context
 - If you see package.json or requirements.txt, use the EXACT versions listed
-- Do NOT invent components or patterns not evidenced in the provided context
+- Do NOT invent components or patterns not evidenced in the provided context, BUT if the directory structure is flat (e.g. all files in root), logically group files into components (e.g. "Main Process", "Renderer Process", "Core Logic") so the components list is NEVER empty.
 - If something is uncertain, say so in flagged_issues — don't hallucinate
 - For architecture_summary: describe the actual request/response flow through the system
-- For data_flow: trace data from user input → processing → storage → response
-- For dependency_graph: name actual components you can confirm exist (directories, services)
-- For detected_patterns: only include patterns you have evidence for"""
+- For data_flow: trace data from user input → processing → storage → response. This field is REQUIRED.
+- For dependency_graph: name actual components you can confirm exist. This field is REQUIRED.
+- For detected_patterns: only include patterns you have evidence for. This field is REQUIRED.
+- ALL fields in the JSON schema are strictly REQUIRED. You MUST provide a value, even if it is an empty list/dict or a string saying "None detected". Do NOT omit any fields."""
 
         user_prompt = f"""Repository: {repo_url}
 Commit: {commit_sha}
