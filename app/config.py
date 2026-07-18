@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     github_token: str = ""
     database_url: str = ""
     nvidia_api_key: str = ""
+    repo_analizer_model: str = "llama-3.3-70b-versatile"
     # Optional ones
     supabase_url: str = ""
     supabase_key: str = ""
