@@ -2,11 +2,15 @@
 Multi-pass repository summarizer.
 
 Pass 1: Read critical files in full + build structural map (no LLM)
-Pass 2: Generate file-group summaries in parallel (map-reduce style) — LLM
-Pass 3: Architecture synthesis — LLM
-Pass 4: Final structured RepoBrief generation — LLM with structured output
+Pass 2: Targeted similarity search (no LLM)
+Pass 3: Parallel file-group summaries — fast LLM (thinking OFF, 2048 tokens)
+Pass 4: Final synthesis — reasoning LLM (thinking ON, 16384 tokens, 1M context window)
 
-This replaces the old single-pass approach that fed only 9 similarity-searched chunks.
+nvidia/nemotron-3-super-120b-a12b advantages exploited:
+  - 1M token context window: feed full critical files + all group summaries without truncation
+  - Reasoning mode (CoT): enabled on final pass for architecture-level reasoning
+  - RAG-optimized: model tuned for exactly this retrieval-augmented generation pattern
+  - LatentMoE: 12B active params — faster than 120B dense at inference
 """
 
 import asyncio
@@ -17,7 +21,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.models.brief import RepoBrief, ComponentInfo, TechItem, FileReference
-from app.services.llm import get_llm
+from app.services.llm import get_fast_llm, get_reasoning_llm
 from app.services.pipeline import ProcessingPipeline
 from app.services.repo_map import RepoMap
 from app.services.github_client import GitHubClient
@@ -28,19 +32,28 @@ from app.config import settings
 MAX_CRITICAL_FILE_CHARS = settings.max_file_content_chars
 
 # How many source chunks to retrieve per targeted query
-CHUNKS_PER_QUERY = 4
+CHUNKS_PER_QUERY = 5
 
-# Max total context chars for Pass 2 group summaries
-MAX_GROUP_CONTEXT_CHARS = 12_000
+# Max total context chars fed to each group summary call (fast LLM)
+MAX_GROUP_CONTEXT_CHARS = 15_000
 
-# Max source files to summarize in Pass 2 (we already read critical files directly)
-MAX_SOURCE_GROUPS = 8
+# Parallel group summary buckets
+MAX_SOURCE_GROUPS = 10
+
+# Context caps for final synthesis — generous thanks to 1M context window
+# (chars, not tokens; rough 1 token ≈ 4 chars)
+SYNTHESIS_CRITICAL_FILES_CHARS = 30_000   # was 10k
+SYNTHESIS_SUMMARIES_CHARS      = 15_000   # was 4k
+SYNTHESIS_SEARCH_CHARS         = 15_000   # was 5k
 
 
 class RepoSummarizer:
     def __init__(self):
-        self.llm = get_llm(temperature=0.0)
-        self.llm_structured = get_llm(temperature=0.0).with_structured_output(RepoBrief)
+        # Fast LLM: thinking OFF, 2048 output tokens — for parallel group summaries
+        self.fast_llm = get_fast_llm()
+        # Reasoning LLM: thinking ON (if enabled), 16384 output tokens — for final synthesis
+        self.reasoning_llm = get_reasoning_llm()
+        self.reasoning_llm_structured = get_reasoning_llm().with_structured_output(RepoBrief)
         self.pipeline = ProcessingPipeline()
         self.repo_map_builder = RepoMap()
         self.github = GitHubClient()
@@ -315,7 +328,7 @@ class RepoSummarizer:
                 HumanMessage(content=f"Directory/Group: {group_key}\n\n{context}"),
             ])
             try:
-                result = await self.llm.ainvoke(prompt.format_messages())
+                result = await self.fast_llm.ainvoke(prompt.format_messages())
                 return f"[{group_key}]\n{result.content}"
             except Exception as e:
                 print(f"  Group summary failed for '{group_key}': {e}")
@@ -403,7 +416,7 @@ GitHub metadata:
   - Topics: {', '.join(meta.get('topics', []))}
 
 === DIRECTORY STRUCTURE ===
-{ascii_tree[:3000]}
+{ascii_tree[:4000]}
 
 === AUTO-DETECTED FRAMEWORKS & DEPENDENCIES ===
 {frameworks_text}
@@ -412,28 +425,27 @@ GitHub metadata:
 {components_text}
 
 === MANIFEST / DEPENDENCY DETAILS ===
-{manifest_text[:4000]}
+{manifest_text[:6000]}
 
 === FULL CRITICAL FILES (README, configs, entry points) ===
-{critical_files_text[:10000]}
+{critical_files_text[:30000]}
 
 === PER-COMPONENT SUMMARIES ===
-{summaries_text[:4000]}
+{summaries_text[:15000]}
 
 === TARGETED CODE SEARCH RESULTS ===
-{search_text[:5000]}
+{search_text[:15000]}
 
 Now produce the complete RepoBrief with ALL fields populated accurately."""
 
-        print("  Calling LLM for final structured RepoBrief generation...")
+        print("  Calling reasoning LLM (thinking=ON) for final structured RepoBrief...")
         try:
-            brief = await self.llm_structured.ainvoke([
+            brief = await self.reasoning_llm_structured.ainvoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt),
             ])
         except Exception as e:
-            print(f"  Structured output failed, trying with fallback: {e}")
-            # Fallback: try again with smaller context
+            print(f"  Structured output failed, falling back: {e}")
             brief = await self._synthesize_brief_fallback(
                 repo_url, commit_sha, structural_context, detected_frameworks
             )
@@ -516,4 +528,4 @@ Manifests:
 
 Generate a complete RepoBrief."""),
         ])
-        return await self.llm_structured.ainvoke(prompt.format_messages())
+        return await self.reasoning_llm_structured.ainvoke(prompt.format_messages())
