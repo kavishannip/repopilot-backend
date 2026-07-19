@@ -12,10 +12,10 @@ class Settings(BaseSettings):
     nvidia_api_key: str = ""
     # Embedding model (nemotron-3-embed-1b, 2048-dim vectors)
     nvidia_embed_model: str = "nvidia/nemotron-3-embed-1b"
-    # Chunks per embedding request — smaller = safer on free tier
-    embed_batch_size: int = 10
-    # Seconds to wait between embedding batches — prevents RPM rate-limit 503s on large repos
-    embed_inter_batch_delay_s: float = 1.5
+    # Chunks per embedding request — smaller = safer on free tier, but nemotron-3-embed-1b supports 50
+    embed_batch_size: int = 50
+    # RPM limit for NVIDIA API (free tier is 40)
+    embed_rpm_limit: int = 35
     # LLM: nemotron-3-super-120b-a12b — 1M ctx, LatentMoE, reasoning mode, RAG-optimized
     repo_analizer_model: str = "nvidia/nemotron-3-super-120b-a12b"
     # Enable chain-of-thought reasoning on final synthesis pass (slower but more accurate)
@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     # Context budget for final synthesis — 1M ctx window means we can be generous
     llm_max_tokens: int = 16384   # output token cap (generous for rich structured JSON)
     llm_context_chars: int = 60_000  # total input context chars to feed final synthesis
+    
+    # ── Smart File Selection ─────────────────────────────────
+    smart_file_select_enabled: bool = True
+    smart_file_select_max_files: int = 50
 
     # ── Groq (Phase 3 group summaries) ──────────────────────
     groq_api_key: str = ""

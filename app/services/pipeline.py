@@ -60,7 +60,6 @@ class ProcessingPipeline:
                     description=meta["description"]
                 )
                 session.add(repo_obj)
-                await session.flush() # to get ID
             else:
                 repo_obj.commit_sha = commit_sha
                 repo_obj.language = meta["language"]
@@ -69,43 +68,62 @@ class ProcessingPipeline:
                 
                 # Delete old chunks
                 await session.execute(delete(RepoChunk).where(RepoChunk.repository_id == repo_obj.id))
-                await session.flush()
+            
+            await session.commit()
+            repo_id = repo_obj.id
 
-            # Now fetch files
-            print("Fetching file list...")
-            files = await self.github.list_files(repo_url)
+        # --- OUTSIDE DB TRANSACTION: Heavy I/O and processing ---
+        
+        # Now fetch files
+        print("Fetching file list...")
+        files = await self.github.list_files(repo_url)
+        
+        # Apply smart file selection to reduce chunks
+        from app.services.file_selector import SmartFileSelector
+        selector = SmartFileSelector()
+        tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+        classification = tree_data["classification"]
+        
+        # Build ASCII tree manually for selector (since repo_map requires full pass)
+        from app.services.repo_map import RepoMap
+        ascii_tree = RepoMap().build_ascii_tree(tree_data["nested_tree"], max_depth=4)
+        
+        files = await selector.select_files(files, classification, ascii_tree)
+        
+        all_chunks = []
+        
+        print(f"Processing {len(files)} files...")
+        
+        async def fetch_and_chunk(f):
+            try:
+                content = await self.github.get_file_content(repo_url, f["path"])
+                if content:
+                    return self.chunker.chunk_file(f["path"], content)
+            except Exception as e:
+                import traceback
+                tb_msg = traceback.format_exc().splitlines()[-2] if traceback.format_exc().strip() else ""
+                print(f"Failed to process {f['path']}: {repr(e)} | Details: {tb_msg}")
+            return []
             
-            all_chunks = []
-            
-            print(f"Processing {len(files)} files...")
-            
-            async def fetch_and_chunk(f):
-                try:
-                    content = await self.github.get_file_content(repo_url, f["path"])
-                    if content:
-                        return self.chunker.chunk_file(f["path"], content)
-                except Exception as e:
-                    import traceback
-                    tb_msg = traceback.format_exc().splitlines()[-2] if traceback.format_exc().strip() else ""
-                    print(f"Failed to process {f['path']}: {repr(e)} | Details: {tb_msg}")
-                return []
+        batch_size = 30
+        for i in range(0, len(files), batch_size):
+            batch = files[i:i+batch_size]
+            results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
+            for file_chunks in results:
+                all_chunks.extend(file_chunks)
                 
-            batch_size = 30
-            for i in range(0, len(files), batch_size):
-                batch = files[i:i+batch_size]
-                results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
-                for file_chunks in results:
-                    all_chunks.extend(file_chunks)
-                    
-            print(f"Total chunks generated: {len(all_chunks)}")
+        print(f"Total chunks generated: {len(all_chunks)}")
+        
+        # Batch embedding
+        embeddings = []
+        if all_chunks:
+            texts = [c["text"] for c in all_chunks]
+            print(f"Embedding {len(texts)} chunks...")
+            embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
             
-            # Batch embedding
-            if all_chunks:
-                texts = [c["text"] for c in all_chunks]
-                print(f"Embedding {len(texts)} chunks...")
-                embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
-                
-                # Save to DB
+        # --- NEW DB TRANSACTION: Save chunks ---
+        async with async_session() as session:
+            if all_chunks and embeddings:
                 print("Saving to database...")
                 db_chunks = []
                 for i, c in enumerate(all_chunks):
@@ -121,7 +139,7 @@ class ProcessingPipeline:
                             
                     db_chunks.append(
                         RepoChunk(
-                            repository_id=repo_obj.id,
+                            repository_id=repo_id,
                             chunk_text=clean_text,
                             chunk_metadata=clean_metadata,
                             embedding=embeddings[i]
