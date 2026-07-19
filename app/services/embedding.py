@@ -68,21 +68,21 @@ class NVIDIAEmbeddingClient:
             # Throttle: Wait for token to stay within NVIDIA RPM limit
             await self._acquire_token()
 
-            embeddings = await self._embed_single_batch(batch, batch_idx, len(batches))
+            embeddings = await self._embed_single_batch(batch, batch_idx, len(batches), input_type)
             all_embeddings.extend(embeddings)
 
         logger.info(f"  [Embed] {len(chunks)} chunks embedded in {len(batches)} batches")
         return all_embeddings
 
     async def _embed_single_batch(
-        self, batch: List[str], batch_idx: int, total_batches: int
+        self, batch: List[str], batch_idx: int, total_batches: int, input_type: str
     ) -> List[List[float]]:
         """Embed one batch with exponential backoff retry on server/network errors."""
         payload = {
             "input": batch,
             "model": self.model,
             "encoding_format": "float",
-            "input_type": "passage",
+            "input_type": input_type,
         }
         max_retries = 6
         for attempt in range(max_retries):
