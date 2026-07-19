@@ -304,7 +304,13 @@ class RepoSummarizer:
         except Exception as e:
             print(f"  [Pass 4] FAILED: {e}. Serving lite brief fallback.")
             brief = self._build_lite_brief(
-                structural_context, group_summaries, repo_url, commit_sha, error=str(e)
+                structural_context, 
+                group_summaries, 
+                repo_url, 
+                commit_sha, 
+                process_stats.get("selected_files", []),
+                structural_context.get("project_types", []),
+                error=str(e)
             )
 
         print(f"\n{'='*60}")
@@ -820,6 +826,8 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
         group_summaries: List[str],
         repo_url: str,
         commit_sha: str,
+        selected_files: List[str] = None,
+        project_types: List[str] = None,
         error: str = "",
     ) -> RepoBrief:
         """
@@ -870,6 +878,8 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
             framework_details=detected_frameworks,
             directory_structure=ascii_tree[:2000],
             dependency_graph={c["name"]: [] for c in inferred_components},
+            selected_files=selected_files or [],
+            project_types=project_types or [],
         )
 
     # ─────────────────────────────────────────────────────────
