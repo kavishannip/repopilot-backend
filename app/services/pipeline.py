@@ -40,11 +40,20 @@ class ProcessingPipeline:
                 stmt_count = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
                 res = await session.execute(stmt_count)
                 chunks = res.scalars().all()
+                
+                # Extract unique files that were actually chunked
+                selected_paths = set()
+                for c in chunks:
+                    path = c.chunk_metadata.get("path")
+                    if path:
+                        selected_paths.add(path)
+                        
                 return {
                     "status": "cached",
                     "repo_url": repo_url,
                     "commit_sha": commit_sha,
-                    "chunks_count": len(chunks)
+                    "chunks_count": len(chunks),
+                    "selected_files": list(selected_paths)
                 }
 
             # If it exists but different commit, update. If not exists, create.
@@ -105,12 +114,13 @@ class ProcessingPipeline:
                 print(f"Failed to process {f['path']}: {repr(e)} | Details: {tb_msg}")
             return []
             
-        batch_size = 30
+        batch_size = 5
         for i in range(0, len(files), batch_size):
             batch = files[i:i+batch_size]
             results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
             for file_chunks in results:
                 all_chunks.extend(file_chunks)
+            await asyncio.sleep(0.5)
                 
         print(f"Total chunks generated: {len(all_chunks)}")
         
@@ -154,7 +164,8 @@ class ProcessingPipeline:
                 "status": "processed",
                 "repo_url": repo_url,
                 "commit_sha": commit_sha,
-                "chunks_count": len(all_chunks)
+                "chunks_count": len(all_chunks),
+                "selected_files": [f["path"] for f in files]
             }
             
     async def _get_branch_commit(self, repo_url: str, branch: str) -> str:

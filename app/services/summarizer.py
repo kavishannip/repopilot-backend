@@ -50,9 +50,9 @@ MAX_GROUP_CONTEXT_CHARS = 15_000
 MAX_SOURCE_GROUPS = 10
 
 # Context caps for final synthesis
-SYNTHESIS_CRITICAL_FILES_CHARS = 30_000
-SYNTHESIS_SUMMARIES_CHARS = 15_000
-SYNTHESIS_SEARCH_CHARS = 15_000
+SYNTHESIS_CRITICAL_FILES_CHARS = 40_000
+SYNTHESIS_SUMMARIES_CHARS = 20_000
+SYNTHESIS_SEARCH_CHARS = 20_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +295,7 @@ class RepoSummarizer:
                 group_summaries=group_summaries,
                 dep_usage=dep_usage,
                 env_vars=env_vars,
+                selected_files=process_stats.get("selected_files", [])
             )
             print(f"  Done in {time.time()-t4:.1f}s")
         except Exception as e:
@@ -314,7 +315,8 @@ class RepoSummarizer:
 
     async def _build_structural_context(self, repo_url: str) -> Dict[str, Any]:
         """Fetch file tree, classify files, read critical/entry/config files in full. No LLM."""
-        meta = await self.github.get_repo_metadata(repo_url)
+        enriched_data = await self.github.get_repo_enriched_metadata(repo_url)
+        meta = enriched_data["meta"]
         branch = meta["default_branch"]
 
         tree_data = await self.github.get_file_tree_structure(repo_url, branch)
@@ -348,7 +350,7 @@ class RepoSummarizer:
 
         # Parse manifests
         parsed_manifests = {}
-        for filename in ["package.json", "requirements.txt", "pyproject.toml"]:
+        for filename in ["package.json", "requirements.txt", "pyproject.toml", "go.mod", "pom.xml"]:
             matching = [p for p in classification["critical"] if p.endswith(filename)]
             for path in matching[:1]:
                 content = full_file_contents.get(path, "")
@@ -359,6 +361,10 @@ class RepoSummarizer:
                         parsed_manifests[path] = self.repo_map_builder.parse_requirements_txt(content)
                     elif filename == "pyproject.toml":
                         parsed_manifests[path] = self.repo_map_builder.parse_pyproject_toml(content)
+                    elif filename == "go.mod":
+                        parsed_manifests[path] = self.repo_map_builder.parse_go_mod(content)
+                    elif filename == "pom.xml":
+                        parsed_manifests[path] = self.repo_map_builder.parse_pom_xml(content)
 
         detected_frameworks = self.repo_map_builder.detect_frameworks(classification, parsed_manifests)
         print(f"  Detected frameworks: {list(detected_frameworks.keys())[:8]}")
@@ -369,6 +375,15 @@ class RepoSummarizer:
 
         return {
             "meta": meta,
+            "language_breakdown": enriched_data["language_breakdown"],
+            "repo_metadata": {
+                "license": meta.get("license", "None"),
+                "created_at": meta.get("created_at", ""),
+                "latest_release": enriched_data.get("latest_release", "None"),
+                "contributors_count": enriched_data.get("contributors_count", 0),
+                "forks": meta.get("forks", 0),
+                "archived": meta.get("archived", False),
+            },
             "branch": branch,
             "classification": classification,
             "dir_languages": dir_languages,
@@ -574,6 +589,7 @@ class RepoSummarizer:
         group_summaries: List[str],
         dep_usage: Dict[str, str],
         env_vars: Dict[str, List[str]],
+        selected_files: List[str] = None,
     ) -> RepoBrief:
         """
         Combine all context and produce the final RepoBrief.
@@ -581,6 +597,8 @@ class RepoSummarizer:
         similarity search (with real line refs), dep usage, env vars (all ground truth).
         """
         meta = structural_context["meta"]
+        language_breakdown = structural_context["language_breakdown"]
+        repo_metadata = structural_context["repo_metadata"]
         ascii_tree = structural_context["ascii_tree"]
         manifest_text = structural_context["manifest_text"]
         detected_frameworks = structural_context["detected_frameworks"]
@@ -598,6 +616,13 @@ class RepoSummarizer:
             f"  - /{c['name']}: {c['estimated_role']} [{c['primary_language']}]"
             for c in inferred_components
         )
+        
+        # Format language breakdown
+        lang_text = "\n".join(f"  - {lang}: {pct}%" for lang, pct in language_breakdown.items())
+        
+        # Format repo metadata
+        meta_text = "\n".join(f"  - {k}: {v}" for k, v in repo_metadata.items())
+        
         dep_usage_text = _format_dep_usage(dep_usage)
         env_vars_text = _format_env_vars(env_vars)
 
@@ -623,7 +648,11 @@ STRICT RULES:
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
 - STRICT ANTI-HALLUCINATION RULE: You must ONLY use information explicitly present in the provided context. If the context does not contain enough information to accurately populate a field, you MUST output 'Not available' (for strings) or an empty list/object (for arrays/dicts). Do NOT guess, infer, or fabricate any details, names, or versions.
-- If uncertain, say so in flagged_issues."""
+- If uncertain, say so in flagged_issues.
+- LANGUAGE BREAKDOWN is from GitHub's byte-count analysis — treat as GROUND TRUTH for tech_stack. Every language listed MUST appear in tech_stack. Do not omit languages visible in the breakdown.
+- DIRECTORY STRUCTURE is complete — use it to identify ALL components. Every top-level directory with source code is a potential component.
+- key_files: for each component, list at least 2-3 files from the directory structure that appear architecturally significant (entry points, configs, main files).
+- dependency_graph: infer edges from import analysis AND from architectural relationships visible in the directory structure and component descriptions."""
 
         user_prompt = f"""Repository: {repo_url}
 Commit: {commit_sha}
@@ -633,8 +662,14 @@ GitHub metadata:
   - Description: {meta.get('description', 'No description')}
   - Topics: {', '.join(meta.get('topics', []))}
 
+=== GITHUB REPOSITORY METADATA (verified) ===
+{meta_text}
+
+=== LANGUAGE BREAKDOWN BY DIRECTORY (ground truth from GitHub API) ===
+{lang_text}
+
 === DIRECTORY STRUCTURE ===
-{ascii_tree[:4000]}
+{ascii_tree[:12000]}
 
 === AUTO-DETECTED FRAMEWORKS & DEPENDENCIES ===
 {frameworks_text}
@@ -676,8 +711,11 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
         # Convert LLMRepoBrief to full RepoBrief, injecting static analysis
         final_brief = RepoBrief(
             **brief.model_dump(),
-            directory_structure=ascii_tree[:2000],
+            directory_structure=ascii_tree, # Provide full ascii tree to frontend without truncation
             framework_details=detected_frameworks,
+            language_breakdown=language_breakdown,
+            repo_metadata=repo_metadata,
+            selected_files=selected_files or []
         )
 
         return final_brief

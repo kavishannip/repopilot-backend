@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 class FileReference(BaseModel):
@@ -65,5 +65,17 @@ class RepoBrief(LLMRepoBrief):
         description="Detected frameworks and tools with versions: {'Next.js': '15.x', 'React': '18.x'}"
     )
     directory_structure: str = Field(
-        description="ASCII tree showing project directory structure (top 3-4 levels)"
+        description="ASCII tree showing project directory structure (full tree)"
+    )
+    language_breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Percentage of code in each language (e.g. {'Go': 45.2, 'Java': 34.8})"
+    )
+    repo_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Repository metadata (license, latest release, contributors, etc.)"
+    )
+    selected_files: List[str] = Field(
+        default_factory=list,
+        description="List of files that were selected as architecturally significant and used for deep analysis."
     )

@@ -133,7 +133,74 @@ class GitHubClient:
                 "topics": data.get("topics", []),
                 "homepage": data.get("homepage", ""),
                 "open_issues": data.get("open_issues_count", 0),
+                "license": data.get("license", {}).get("name", "None") if data.get("license") else "None",
+                "created_at": data.get("created_at", ""),
+                "forks": data.get("forks_count", 0),
+                "archived": data.get("archived", False),
             }
+
+    async def get_repo_enriched_metadata(self, repo_url: str) -> Dict[str, Any]:
+        owner, repo = self._parse_repo_url(repo_url)
+        
+        async def fetch_json(url):
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                resp = await client.get(url, headers=self.headers)
+                if resp.status_code == 200:
+                    return resp.json()
+                return {}
+                
+        async def fetch_contributors_count():
+            # Get contributors count from Link header for per_page=1
+            async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://api.github.com/repos/{owner}/{repo}/contributors?per_page=1",
+                    headers=self.headers
+                )
+                if resp.status_code == 200:
+                    link_header = resp.headers.get("Link", "")
+                    if link_header:
+                        import re
+                        match = re.search(r'page=(\d+)>; rel="last"', link_header)
+                        if match:
+                            return int(match.group(1))
+                    # If no link header, just count the elements
+                    return len(resp.json())
+                return 0
+
+        # Run concurrently
+        import asyncio
+        meta_task = self.get_repo_metadata(repo_url)
+        langs_task = fetch_json(f"https://api.github.com/repos/{owner}/{repo}/languages")
+        release_task = fetch_json(f"https://api.github.com/repos/{owner}/{repo}/releases/latest")
+        contrib_task = fetch_contributors_count()
+        
+        meta, langs, release, contribs = await asyncio.gather(
+            meta_task, langs_task, release_task, contrib_task, return_exceptions=True
+        )
+        
+        # Handle exceptions if any task failed
+        if isinstance(meta, Exception):
+            raise meta
+        
+        langs_data = langs if not isinstance(langs, Exception) else {}
+        release_data = release if not isinstance(release, Exception) else {}
+        contribs_data = contribs if not isinstance(contribs, Exception) else 0
+
+        # Calculate language percentages
+        total_bytes = sum(langs_data.values()) if langs_data else 0
+        language_breakdown = {}
+        if total_bytes > 0:
+            language_breakdown = {
+                lang: round((bytes_cnt / total_bytes) * 100, 1)
+                for lang, bytes_cnt in langs_data.items()
+            }
+
+        return {
+            "meta": meta,
+            "language_breakdown": language_breakdown,
+            "latest_release": release_data.get("tag_name", "None"),
+            "contributors_count": contribs_data
+        }
 
     async def list_files(self, repo_url: str, branch: str = None) -> List[Dict[str, Any]]:
         owner, repo = self._parse_repo_url(repo_url)
@@ -358,23 +425,40 @@ class GitHubClient:
 
         return sorted(files, key=get_score)
 
+    _raw_download_semaphore = None
+    
     async def get_file_content(self, repo_url: str, path: str, branch: str = None) -> Optional[str]:
+        import asyncio
+        if not hasattr(self, "_raw_download_semaphore") or not self._raw_download_semaphore:
+            self._raw_download_semaphore = asyncio.Semaphore(2)
+            
         owner, repo = self._parse_repo_url(repo_url)
         if not branch:
             meta = await self.get_repo_metadata(repo_url)
             branch = meta["default_branch"]
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            resp = await client.get(
-                f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
-                headers=self.headers
-            )
-            if resp.status_code == 200:
-                return resp.text
-            elif resp.status_code == 404:
+        async with self._raw_download_semaphore:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+                resp = await client.get(
+                    f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
+                    headers=self.headers
+                )
+                if resp.status_code == 200:
+                    return resp.text
+                elif resp.status_code == 404:
+                    return None
+                elif resp.status_code == 429 or resp.status_code == 403:
+                    print(f"Rate limited by raw.githubusercontent.com for {path}. Waiting 5s...")
+                    await asyncio.sleep(5)
+                    # Retry once
+                    resp = await client.get(
+                        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
+                        headers=self.headers
+                    )
+                    if resp.status_code == 200:
+                        return resp.text
+                    return None
                 return None
-            self._handle_rate_limit(resp)
-            return None
 
     async def get_files_content_batch(
         self,

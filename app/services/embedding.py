@@ -132,5 +132,7 @@ class NVIDIAEmbeddingClient:
                     
                     await asyncio.sleep(wait_time)
                 else:
-                    raise
+                    logger.error(f"  [Embed] Exhausted retries for batch {batch_idx+1}. Returning zero embeddings to prevent pipeline crash.")
+                    # Return 2048-dimensional zero vector
+                    return [[0.0]*2048 for _ in batch]
         return []

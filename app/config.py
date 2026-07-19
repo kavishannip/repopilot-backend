@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     # Embedding model (nemotron-3-embed-1b, 2048-dim vectors)
     nvidia_embed_model: str = "nvidia/nemotron-3-embed-1b"
     # Chunks per embedding request — smaller = safer on free tier, but nemotron-3-embed-1b supports 50
-    embed_batch_size: int = 50
+    embed_batch_size: int = 10
     # RPM limit for NVIDIA API (free tier is 40)
     embed_rpm_limit: int = 35
     # LLM: nemotron-3-super-120b-a12b — 1M ctx, LatentMoE, reasoning mode, RAG-optimized
