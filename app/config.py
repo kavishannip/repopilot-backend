@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     nvidia_api_key: str = ""
     # Embedding model (nemotron-3-embed-1b, 2048-dim vectors)
     nvidia_embed_model: str = "nvidia/nemotron-3-embed-1b"
+    # Chunks per embedding request — smaller = safer on free tier
+    embed_batch_size: int = 10
+    # Seconds to wait between embedding batches — prevents RPM rate-limit 503s on large repos
+    embed_inter_batch_delay_s: float = 1.5
     # LLM: nemotron-3-super-120b-a12b — 1M ctx, LatentMoE, reasoning mode, RAG-optimized
     repo_analizer_model: str = "nvidia/nemotron-3-super-120b-a12b"
     # Enable chain-of-thought reasoning on final synthesis pass (slower but more accurate)

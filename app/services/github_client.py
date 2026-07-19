@@ -108,7 +108,7 @@ class GitHubClient:
 
     async def get_repo_metadata(self, repo_url: str) -> Dict[str, Any]:
         owner, repo = self._parse_repo_url(repo_url)
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo}",
                 headers=self.headers
@@ -141,7 +141,7 @@ class GitHubClient:
             meta = await self.get_repo_metadata(repo_url)
             branch = meta["default_branch"]
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1",
                 headers=self.headers
@@ -174,7 +174,7 @@ class GitHubClient:
             meta = await self.get_repo_metadata(repo_url)
             branch = meta["default_branch"]
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1",
                 headers=self.headers
@@ -364,7 +364,7 @@ class GitHubClient:
             meta = await self.get_repo_metadata(repo_url)
             branch = meta["default_branch"]
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             resp = await client.get(
                 f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
                 headers=self.headers

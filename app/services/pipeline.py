@@ -85,7 +85,9 @@ class ProcessingPipeline:
                     if content:
                         return self.chunker.chunk_file(f["path"], content)
                 except Exception as e:
-                    print(f"Failed to process {f['path']}: {e}")
+                    import traceback
+                    tb_msg = traceback.format_exc().splitlines()[-2] if traceback.format_exc().strip() else ""
+                    print(f"Failed to process {f['path']}: {repr(e)} | Details: {tb_msg}")
                 return []
                 
             batch_size = 30
