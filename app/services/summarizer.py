@@ -702,7 +702,7 @@ STRICT RULES:
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
 - SYNTHESIZE CONFIDENTLY: The provided context contains everything you need. Synthesize the snippets, summaries, and structural maps to comprehensively fill out EVERY field. NEVER leave a field empty or output an empty list/object. If a specific detail is missing, infer the most likely architectural pattern based on standard practices for the detected frameworks.
-- If highly uncertain about a specific detail, state your assumption in flagged_issues rather than leaving the field blank.
+- FLAGGED ISSUES: Do NOT hallucinate or invent issues. Only flag discrepancies you are fully certain of, based on well-known, well-established patterns in the code. Do not flag missing imports/dependencies that may be implicitly loaded or globally registered by the stack in use. If no concrete issues are found, leave this array empty.
 - JSON SCHEMA COMPLIANCE: You must strictly adhere to the provided schema. Do NOT output a blank or empty JSON skeleton. EVERY string field must contain a detailed description (minimum 2 sentences). EVERY list field must contain all relevant items found in the context.
 - NO MARKDOWN REPORTS: You must return the results SOLELY by populating the provided JSON/function schema. Do NOT write a markdown report or table. ALL information must be placed inside the schema fields.
 - LIST POPULATION MANDATE: You MUST populate arrays correctly. Do NOT cram component or tech stack lists into the `summary` or `architecture_summary` strings. Use the proper `components` and `tech_stack` arrays.
