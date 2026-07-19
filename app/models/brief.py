@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 
 class FileReference(BaseModel):
@@ -23,7 +23,7 @@ class TechItem(BaseModel):
     purpose: str = Field(description="What role this technology plays in the project")
 
 
-class RepoBrief(BaseModel):
+class LLMRepoBrief(BaseModel):
     # Core fields
     tech_stack: List[TechItem] = Field(
         description="List of main technologies with versions and categories"
@@ -52,13 +52,41 @@ class RepoBrief(BaseModel):
         description="Architectural/design patterns detected: e.g. 'MVC', 'REST API', 'PWA', 'Server-Side Rendering', 'Event-driven', 'Monorepo'"
     )
 
-    # Rich metadata
+    dependency_graph: Dict[str, List[str]] = Field(
+        description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
+    )
+
+
+class RepoBrief(LLMRepoBrief):
+    """
+    Final output schema including statically generated fields.
+    """
     framework_details: Dict[str, str] = Field(
         description="Detected frameworks and tools with versions: {'Next.js': '15.x', 'React': '18.x'}"
     )
     directory_structure: str = Field(
-        description="ASCII tree showing project directory structure (top 3-4 levels)"
+        description="ASCII tree showing project directory structure (full tree)"
     )
-    dependency_graph: Dict[str, List[str]] = Field(
-        description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
+    language_breakdown: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Percentage of code in each language (e.g. {'Go': 45.2, 'Java': 34.8})"
+    )
+    repo_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "All GitHub API metadata: stars, forks, watchers, open_issues, topics, homepage, "
+            "license, created_at, updated_at, pushed_at, visibility, is_fork, archived, "
+            "contributors_count, latest_release, size_kb, has_wiki, has_discussions, etc."
+        )
+    )
+    project_types: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Detected project type markers from the file tree, e.g. ['Python', 'Django', 'Docker', 'Monorepo']. "
+            "Derived from PROJECT_TYPE_MARKERS heuristics — not LLM-generated."
+        )
+    )
+    selected_files: List[str] = Field(
+        default_factory=list,
+        description="Files selected as architecturally significant and used for deep analysis."
     )

@@ -200,6 +200,69 @@ class RepoMap:
             "identified_technologies": identified,
         }
 
+    def parse_go_mod(self, content: str) -> Dict[str, Any]:
+        """Extract dependencies from go.mod."""
+        deps = {}
+        identified = {}
+        
+        # Simple regex for extracting required modules
+        import re
+        # Find 'require' blocks or single requires
+        matches = re.finditer(r'(?:require\s+\(\s*([\s\S]*?)\s*\)|require\s+([^\n]+))', content)
+        for match in matches:
+            block = match.group(1) or match.group(2)
+            for line in block.splitlines():
+                line = line.strip()
+                if not line or line.startswith("//"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    name = parts[0]
+                    version = parts[1]
+                    deps[name] = version
+                    
+                    # Some basic Go tech detection
+                    if "go-control-plane" in name: identified["Envoy go-control-plane"] = version
+                    elif "grpc" in name: identified["gRPC"] = version
+                    elif "gin" in name: identified["Gin"] = version
+                    elif "echo" in name: identified["Echo"] = version
+                    elif "gorm" in name: identified["GORM"] = version
+                    
+        return {
+            "all_dependencies": deps,
+            "identified_technologies": identified,
+        }
+
+    def parse_pom_xml(self, content: str) -> Dict[str, Any]:
+        """Extract basic dependencies from pom.xml."""
+        deps = {}
+        identified = {}
+        
+        # Super simple XML parsing via regex for dependencies
+        import re
+        deps_blocks = re.finditer(r'<dependency>([\s\S]*?)</dependency>', content)
+        for block in deps_blocks:
+            dep_xml = block.group(1)
+            group = re.search(r'<groupId>([^<]+)</groupId>', dep_xml)
+            artifact = re.search(r'<artifactId>([^<]+)</artifactId>', dep_xml)
+            version = re.search(r'<version>([^<]+)</version>', dep_xml)
+            
+            if group and artifact:
+                name = f"{group.group(1)}:{artifact.group(1)}"
+                v = version.group(1) if version else "unknown"
+                deps[name] = v
+                
+                # Basic Java tech detection
+                if "spring-boot" in name: identified["Spring Boot"] = v
+                elif "hibernate" in name: identified["Hibernate"] = v
+                elif "nimbus-jose-jwt" in name: identified["Nimbus JWT"] = v
+                elif "grpc" in name: identified["gRPC"] = v
+
+        return {
+            "all_dependencies": deps,
+            "identified_technologies": identified,
+        }
+
     def detect_frameworks(
         self,
         classification: Dict[str, List[str]],

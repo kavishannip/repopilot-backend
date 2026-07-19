@@ -24,7 +24,7 @@ async def test_nvidia_embedding():
     
     payload = {
         "input": ["def hello_world():\n    print('Hello world!')"],
-        "model": "nvidia/nemotron-3-embed-1b",
+        "model": settings.nvidia_embed_model,
         "encoding_format": "float",
         "input_type": "passage"
     }
