@@ -55,6 +55,29 @@ SYNTHESIS_CRITICAL_FILES_CHARS = 40_000
 SYNTHESIS_SUMMARIES_CHARS = 20_000
 SYNTHESIS_SEARCH_CHARS = 20_000
 
+TECH_EVIDENCE_PATTERNS: Dict[str, List[Tuple[str, str]]] = {
+    "mongodb": [
+        ("mongodb", "MongoDB driver import/reference"),
+        ("mongoose", "Mongoose ODM import/reference"),
+        ("mongoclient", "MongoClient usage"),
+        ("mongoose.connect", "Mongoose connection call"),
+        ("mongodb://", "MongoDB connection URI"),
+        ("mongodb+srv://", "MongoDB Atlas connection URI"),
+        ("pymongo", "PyMongo import/reference"),
+        ("motor.motor_asyncio", "Motor async MongoDB import/reference"),
+    ],
+    "redis": [("redis", "Redis import/reference"), ("redis://", "Redis connection URI")],
+    "postgres": [
+        ("postgres", "Postgres reference"),
+        ("postgresql://", "Postgres connection URI"),
+        ("psycopg2", "psycopg2 import/reference"),
+        ("asyncpg", "asyncpg import/reference"),
+        ("pgvector", "pgvector import/reference"),
+    ],
+    "mysql": [("mysql", "MySQL import/reference"), ("mysql://", "MySQL connection URI")],
+    "sqlite": [("sqlite", "SQLite import/reference"), ("sqlite://", "SQLite connection URI")],
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Static analysis helpers (deterministic — injected as ground truth)
@@ -64,14 +87,16 @@ def _analyze_dependency_usage(
     parsed_manifests: Dict[str, Any],
     full_file_contents: Dict[str, str],
     search_context: Dict[str, List[Dict[str, Any]]],
-) -> Dict[str, str]:
+    all_chunks: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Cross-reference manifest deps against actual imports in code.
-    Returns {dep_name: "used" | "declared_only"}.
+    Cross-reference manifest deps against observed imports in analyzed code.
+    Returns {dep_name: {status, evidence}}.
 
     Import data sources:
     1. full_file_contents — regex scan for import/require/from
     2. search_context chunk metadata — chunker.py already extracts imports
+    3. all stored selected chunks — prevents retrieval misses from becoming false issues
     """
     # Collect all declared deps
     declared: Dict[str, str] = {}  # dep_name -> version
@@ -81,57 +106,127 @@ def _analyze_dependency_usage(
     if not declared:
         return {}
 
-    # Collect all imported/required module names from code
     imported_raw: set = set()
+    dep_evidence: Dict[str, List[str]] = {}
 
     # Regex patterns: Python, JS/TS
     import_patterns = [
-        r"(?:from\s+([\w.\-]+)\s+import|import\s+([\w.\-]+))",           # Python
-        r"(?:import|from)\s+['\"]([^'\"]+)['\"]",                        # JS/TS static
-        r"require\(['\"]([^'\"]+)['\"]\)",                               # CommonJS
+        r"^\s*from\s+([\w.\-@/]+)\s+import\b",                           # Python
+        r"^\s*import\s+([\w.\-@/]+)\b",                                  # Python / simple JS default
+        r"^\s*import\s+.*?\s+from\s+['\"]([^'\"]+)['\"]",                # JS/TS static
+        r"^\s*import\s+['\"]([^'\"]+)['\"]",                             # JS/TS side-effect import
+        r"require\(\s*['\"]([^'\"]+)['\"]\s*\)",                         # CommonJS
+        r"await\s+import\(\s*['\"]([^'\"]+)['\"]\s*\)",                  # Dynamic import
     ]
+
+    def normalize_module_name(raw: str) -> str:
+        raw = raw.strip()
+        if raw.startswith("@"):
+            parts = raw.split("/")
+            return "/".join(parts[:2]).lower() if len(parts) >= 2 else raw.lower()
+        return raw.split("/")[0].split(".")[0].lower()
 
     def extract_module_names(text: str) -> set:
         found = set()
-        for pat in import_patterns:
-            for m in re.finditer(pat, text):
+        for line in text.splitlines():
+            for pat in import_patterns:
+                m = re.search(pat, line)
+                if not m:
+                    continue
                 for g in m.groups():
-                    if g:
-                        # Normalize: take first path segment, lowercase
-                        root = g.split("/")[0].split(".")[0].lower().lstrip("@")
-                        if root and len(root) > 1:
-                            found.add(root)
-                            # Also add with @ prefix for scoped packages
-                            if "/" in g and g.startswith("@"):
-                                found.add(g.split("/")[0].lower())
+                    if not g:
+                        continue
+                    root = normalize_module_name(g)
+                    if root and len(root) > 1 and not root.startswith("."):
+                        found.add(root)
         return found
 
-    for content in full_file_contents.values():
-        imported_raw.update(extract_module_names(content))
+    def add_imports_from_text(text: str, source_label: str) -> None:
+        for module_name in extract_module_names(text):
+            imported_raw.add(module_name)
+            dep_evidence.setdefault(module_name, [])
+            if source_label not in dep_evidence[module_name]:
+                dep_evidence[module_name].append(source_label)
+
+    for path, content in full_file_contents.items():
+        add_imports_from_text(content, path)
 
     # Also pull from chunk metadata (chunker already extracted imports)
     for chunks in search_context.values():
         for chunk in chunks:
+            path = chunk.get("metadata", {}).get("path", "unknown")
+            add_imports_from_text(chunk.get("text", ""), path)
             for imp_line in chunk.get("metadata", {}).get("imports", []):
-                imported_raw.update(extract_module_names(imp_line))
+                add_imports_from_text(imp_line, path)
+
+    for chunk in all_chunks or []:
+        metadata = chunk.get("metadata", {})
+        path = metadata.get("path", "unknown")
+        add_imports_from_text(chunk.get("text", ""), path)
+        for imp_line in metadata.get("imports", []):
+            add_imports_from_text(imp_line, path)
 
     # Match declared deps against imported
     result = {}
     for dep, version in declared.items():
-        dep_normalized = dep.lower().lstrip("@").split("/")[0].replace("-", "").replace("_", "")
-        is_used = any(
-            dep_normalized in imp.replace("-", "").replace("_", "")
-            or imp in dep.lower()
-            for imp in imported_raw
-        )
-        result[dep] = "used" if is_used else "declared_only"
+        dep_key = normalize_module_name(dep)
+        dep_compact = dep_key.replace("-", "").replace("_", "")
+        matching_imports = [
+            imp for imp in imported_raw
+            if dep_key == imp
+            or dep_compact == imp.replace("-", "").replace("_", "")
+            or dep_key in imp
+            or imp in dep_key
+        ]
+        evidence = []
+        for imp in matching_imports:
+            evidence.extend(dep_evidence.get(imp, []))
+        result[dep] = {
+            "status": "observed_used" if matching_imports else "not_observed_in_selected_code",
+            "version": version,
+            "matched_imports": sorted(set(matching_imports)),
+            "evidence": sorted(set(evidence))[:8],
+        }
 
     return result
+
+
+def _build_positive_tech_evidence(
+    all_chunks: List[Dict[str, Any]],
+    full_file_contents: Dict[str, str],
+) -> Dict[str, List[str]]:
+    """Find positive technology usage evidence across selected code chunks."""
+    evidence: Dict[str, List[str]] = {}
+
+    def scan_text(text: str, source_label: str) -> None:
+        text_lower = text.lower()
+        for tech, patterns in TECH_EVIDENCE_PATTERNS.items():
+            for needle, description in patterns:
+                if needle in text_lower:
+                    value = f"{source_label}: {description}"
+                    evidence.setdefault(tech, [])
+                    if value not in evidence[tech]:
+                        evidence[tech].append(value)
+
+    for path, content in full_file_contents.items():
+        scan_text(content, path)
+
+    for chunk in all_chunks:
+        metadata = chunk.get("metadata", {})
+        path = metadata.get("path", "unknown")
+        start = metadata.get("start_line")
+        label = f"{path}:L{start}" if start else path
+        scan_text(chunk.get("text", ""), label)
+        for import_line in metadata.get("imports", []):
+            scan_text(import_line, label)
+
+    return {tech: refs[:10] for tech, refs in evidence.items()}
 
 
 def _analyze_env_vars(
     full_file_contents: Dict[str, str],
     search_context: Dict[str, List[Dict[str, Any]]],
+    all_chunks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, List[str]]:
     """
     Grep code for env var reads. Returns {VAR_NAME: [file_path, ...]}.
@@ -173,22 +268,46 @@ def _analyze_env_vars(
             label = f"{path}:L{start}" if start else path
             scan_text(chunk["text"], label)
 
+    for chunk in all_chunks or []:
+        path = chunk.get("metadata", {}).get("path", "unknown")
+        start = chunk.get("metadata", {}).get("start_line", "")
+        label = f"{path}:L{start}" if start else path
+        scan_text(chunk.get("text", ""), label)
+
     return env_vars
 
 
-def _format_dep_usage(dep_usage: Dict[str, str]) -> str:
+def _format_dep_usage(dep_usage: Dict[str, Dict[str, Any]]) -> str:
     """Format dependency usage diff for LLM prompt injection."""
     if not dep_usage:
         return "No manifest found or no dependencies declared."
 
-    used = sorted(k for k, v in dep_usage.items() if v == "used")
-    declared_only = sorted(k for k, v in dep_usage.items() if v == "declared_only")
+    used = sorted(k for k, v in dep_usage.items() if v.get("status") == "observed_used")
+    not_observed = sorted(k for k, v in dep_usage.items() if v.get("status") == "not_observed_in_selected_code")
 
     lines = []
     if used:
-        lines.append(f"ACTUALLY IMPORTED in code ({len(used)}): {', '.join(used[:40])}")
-    if declared_only:
-        lines.append(f"DECLARED IN MANIFEST only — not seen in imports ({len(declared_only)}): {', '.join(declared_only[:30])}")
+        lines.append(f"OBSERVED USED in analyzed code ({len(used)}):")
+        for dep in used[:40]:
+            evidence = ", ".join(dep_usage[dep].get("evidence", [])[:3])
+            lines.append(f"  - {dep}: {evidence or 'import/reference found'}")
+    if not_observed:
+        lines.append(
+            f"NOT OBSERVED in selected analyzed code ({len(not_observed)}), "
+            "but this is NOT proof of an unused dependency and MUST NOT be flagged as an issue by itself:"
+        )
+        lines.append("  - " + ", ".join(not_observed[:40]))
+    return "\n".join(lines)
+
+
+def _format_tech_evidence(tech_evidence: Dict[str, List[str]]) -> str:
+    if not tech_evidence:
+        return "No known database/cache technology usage evidence found in selected code chunks."
+    lines = []
+    for tech, refs in sorted(tech_evidence.items()):
+        lines.append(f"  - {tech}:")
+        for ref in refs[:6]:
+            lines.append(f"      {ref}")
     return "\n".join(lines)
 
 
@@ -263,6 +382,10 @@ class RepoSummarizer:
         )
         print(f"  Done in {time.time()-t2:.1f}s")
 
+        print("\n[Pass 2b] Building full selected-chunk evidence ledger...")
+        all_chunks = await self.pipeline.get_repository_chunks(repo_url)
+        print(f"  Evidence ledger covers {len(all_chunks)} selected chunks")
+
         # ── Pass 3: Parallel file-group summaries (with caching) ──────
         await set_phase("group_summaries")
         t3 = time.time()
@@ -277,12 +400,24 @@ class RepoSummarizer:
             structural_context["parsed_manifests"],
             structural_context["full_file_contents"],
             search_context,
+            all_chunks,
         )
         env_vars = _analyze_env_vars(
             structural_context["full_file_contents"],
             search_context,
+            all_chunks,
         )
-        logger.info(f"Static analysis: {len(dep_usage)} deps classified, {len(env_vars)} env vars found")
+        tech_evidence = _build_positive_tech_evidence(
+            all_chunks,
+            structural_context["full_file_contents"],
+        )
+        structural_context["tech_evidence"] = tech_evidence
+        logger.info(
+            "Static analysis: %s deps classified, %s env vars found, %s tech evidence groups",
+            len(dep_usage),
+            len(env_vars),
+            len(tech_evidence),
+        )
 
         # ── Pass 4: Final synthesis → structured RepoBrief ────────────
         await set_phase("synthesis")
@@ -297,6 +432,7 @@ class RepoSummarizer:
                 group_summaries=group_summaries,
                 dep_usage=dep_usage,
                 env_vars=env_vars,
+                tech_evidence=tech_evidence,
                 selected_files=process_stats.get("selected_files", []),
                 project_types=structural_context.get("project_types", []),
             )
@@ -313,10 +449,22 @@ class RepoSummarizer:
                 error=str(e)
             )
 
+        await self._cache_final_brief(repo_url, commit_sha, brief)
+
         print(f"\n{'='*60}")
         print("Analysis complete.")
         print(f"{'='*60}\n")
         return brief
+
+    async def _cache_final_brief(self, repo_url: str, commit_sha: str, brief: RepoBrief) -> None:
+        """Persist the final brief so future requests for the same commit are instant."""
+        async with async_session() as session:
+            stmt = select(Repository).where(Repository.repo_url == repo_url)
+            result = await session.execute(stmt)
+            repo_obj = result.scalar_one_or_none()
+            if repo_obj and repo_obj.commit_sha == commit_sha:
+                repo_obj.brief = brief.model_dump()
+                await session.commit()
 
     # ─────────────────────────────────────────────────────────
     # Pass 1: Structural map + full critical file reads
@@ -478,6 +626,15 @@ class RepoSummarizer:
             base_queries += ["Redux store, reducers and actions"]
         if any(k in detected_frameworks for k in ["Mongoose ODM", "Prisma ORM", "Drizzle ORM", "SQLAlchemy"]):
             base_queries += ["database schema models and migrations"]
+        if any(k in detected_frameworks for k in ["Mongoose ODM", "PyMongo", "Motor (async MongoDB)"]):
+            base_queries += [
+                "MongoDB Mongoose connection setup database client models schemas",
+                "MongoClient mongoose.connect pymongo motor database usage",
+            ]
+        if any(k in detected_frameworks for k in ["Redis"]):
+            base_queries += ["Redis client cache queue session usage"]
+        if any(k in detected_frameworks for k in ["psycopg2", "asyncpg", "pgvector"]):
+            base_queries += ["PostgreSQL database client queries migrations connection"]
         if "FastAPI" in detected_frameworks:
             base_queries += ["FastAPI routers and dependency injection", "Pydantic request and response models"]
         if "Django" in detected_frameworks:
@@ -489,15 +646,16 @@ class RepoSummarizer:
 
         print(f"  Running {len(base_queries)} targeted queries...")
 
-        async def search(query: str):
-            try:
-                results = await self.pipeline.search_chunks(query, repo_url, top_k=CHUNKS_PER_QUERY)
-                return query, results
-            except Exception as e:
-                print(f"  Search failed for '{query}': {e}")
-                return query, []
-
-        search_results = await asyncio.gather(*(search(q) for q in base_queries))
+        try:
+            batch_results = await self.pipeline.search_chunks_by_queries(
+                base_queries,
+                repo_url,
+                top_k=CHUNKS_PER_QUERY,
+            )
+            search_results = list(batch_results.items())
+        except Exception as e:
+            print(f"  Batched search failed: {e}")
+            search_results = [(query, []) for query in base_queries]
 
         seen_ids = set()
         context_by_topic: Dict[str, List[Dict[str, Any]]] = {}
@@ -638,8 +796,9 @@ class RepoSummarizer:
         structural_context: Dict[str, Any],
         search_context: Dict[str, List[Dict[str, Any]]],
         group_summaries: List[str],
-        dep_usage: Dict[str, str],
+        dep_usage: Dict[str, Dict[str, Any]],
         env_vars: Dict[str, List[str]],
+        tech_evidence: Dict[str, List[str]],
         selected_files: List[str] = None,
         project_types: List[str] = None,
     ) -> RepoBrief:
@@ -678,6 +837,7 @@ class RepoSummarizer:
         
         dep_usage_text = _format_dep_usage(dep_usage)
         env_vars_text = _format_env_vars(env_vars)
+        tech_evidence_text = _format_tech_evidence(tech_evidence)
         project_types_text = ", ".join(project_types) if project_types else "Not detected"
 
         system_prompt = """You are an expert software architect producing a comprehensive repository brief.
@@ -688,7 +848,8 @@ You have been given:
 4. Per-component summaries (from actual code analysis)
 5. Targeted code search results with REAL file:line references
 6. STATIC ANALYSIS: dependency usage (declared vs. actually imported in code)
-7. STATIC ANALYSIS: env vars actually read from code (not docs)
+7. STATIC ANALYSIS: positive technology evidence found across all selected chunks
+8. STATIC ANALYSIS: env vars actually read from code (not docs)
 
 Your task: produce a HIGHLY ACCURATE RepoBrief that could let someone draw an architecture diagram.
 
@@ -696,13 +857,13 @@ STRICT RULES:
 - API endpoints: report HTTP methods ONLY from actual route handler code (@app.get, router.post, app.use). NEVER infer from folder names.
 - Architecture type: label as 'microservices' ONLY if multiple separately deployable services with distinct entry points/Dockerfiles/ports. Multiple modules = 'modular monolith'.
 - File citations: for every claim in architecture_summary and data_flow, cite at least one real file path using the references provided. Use format [filename.ext:Lstart-Lend]. Do NOT invent line numbers — use only what's in the context.
-- Code vs docs: when README/comments contradict code, treat CODE as ground truth. Flag discrepancy in flagged_issues.
+- Code vs docs: flag a README/comment contradiction ONLY when there is positive code evidence that directly contradicts it. Missing evidence, sparse retrieval, or "not observed in selected code" is not a contradiction.
 - Data flow: trace through ACTUAL function names and imports you see. Example: "Request hits router.post('/analyze') in endpoints.py → calls summarizer.generate_brief() → ..."
-- Dependencies: use the STATIC ANALYSIS section for declared vs. used. Do not guess from manifest alone.
+- Dependencies: use the STATIC ANALYSIS section for observed usage. "NOT OBSERVED in selected analyzed code" is uncertainty, not an issue. Never put a dependency into flagged_issues merely because it was not observed.
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
-- ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
-- SYNTHESIZE CONFIDENTLY: The provided context contains everything you need. Synthesize the snippets, summaries, and structural maps to comprehensively fill out EVERY field. NEVER leave a field empty or output an empty list/object. If a specific detail is missing, infer the most likely architectural pattern based on standard practices for the detected frameworks.
-- FLAGGED ISSUES: Do NOT hallucinate or invent issues. Only flag discrepancies you are fully certain of, based on well-known, well-established patterns in the code. Do not flag missing imports/dependencies that may be implicitly loaded or globally registered by the stack in use. If no concrete issues are found, leave this array empty.
+- ALL fields REQUIRED with substantive content when evidence exists. Empty lists are acceptable only when the context has no supporting evidence.
+- EVIDENCE FIRST: Do not infer specific technologies, endpoints, databases, services, deployment topology, auth, or data stores from framework conventions alone. If a detail is not present in metadata, manifests, file contents, summaries, or search results, write "Not evidenced in the analyzed files" instead of inventing it.
+- FLAGGED ISSUES: Use a high-precision policy. Include an issue only if at least one analyzed file provides positive evidence of the problem and no positive evidence section contradicts it. Do not flag "README says MongoDB but code does not use MongoDB" when MongoDB/Mongoose/PyMongo/Motor evidence appears anywhere in positive technology evidence, dependency usage, full files, summaries, or search results. If evidence is incomplete, leave flagged_issues empty.
 - JSON SCHEMA COMPLIANCE: You must strictly adhere to the provided schema. Do NOT output a blank or empty JSON skeleton. EVERY string field must contain a detailed description (minimum 2 sentences). EVERY list field must contain all relevant items found in the context.
 - NO MARKDOWN REPORTS: You must return the results SOLELY by populating the provided JSON/function schema. Do NOT write a markdown report or table. ALL information must be placed inside the schema fields.
 - LIST POPULATION MANDATE: You MUST populate arrays correctly. Do NOT cram component or tech stack lists into the `summary` or `architecture_summary` strings. Use the proper `components` and `tech_stack` arrays.
@@ -722,8 +883,8 @@ STRICT RULES:
 ```
 - LANGUAGE BREAKDOWN is from GitHub's byte-count analysis — treat as GROUND TRUTH for tech_stack. Every language listed MUST appear in tech_stack. Do not omit languages visible in the breakdown.
 - DIRECTORY STRUCTURE is complete — use it to identify ALL components. Every top-level directory with source code is a potential component.
-- key_files: for each component, list at least 2-3 files from the directory structure that appear architecturally significant (entry points, configs, main files).
-- dependency_graph: infer edges from import analysis AND from architectural relationships visible in the directory structure and component descriptions."""
+- key_files: for each component, list files from the directory structure that appear architecturally significant. If fewer than 2 files are evidenced, include only the evidenced files.
+- dependency_graph: include edges supported by imports, route wiring, service calls, configs, or explicit summaries. Do not add dependency edges from directory names alone."""
 
         user_prompt = f"""Repository: {repo_url}
 Commit: {commit_sha}
@@ -757,6 +918,9 @@ GitHub metadata:
 === STATIC ANALYSIS: DEPENDENCY USAGE (declared vs. actually imported in code) ===
 {dep_usage_text}
 
+=== STATIC ANALYSIS: POSITIVE TECHNOLOGY EVIDENCE ACROSS SELECTED CHUNKS ===
+{tech_evidence_text}
+
 === STATIC ANALYSIS: ENVIRONMENT VARIABLES (read from code, not docs) ===
 {env_vars_text}
 
@@ -769,7 +933,7 @@ GitHub metadata:
 === TARGETED CODE SEARCH RESULTS (with real file:line references) ===
 {search_text[:SYNTHESIS_SEARCH_CHARS]}
 
-Now produce the complete RepoBrief with ALL fields populated accurately."""
+Now produce the complete RepoBrief with all evidenced fields populated accurately. Prefer "Not evidenced in the analyzed files" over unsupported guesses."""
 
         parser = PydanticOutputParser(pydantic_object=LLMRepoBrief)
         format_instructions = parser.get_format_instructions()
@@ -814,7 +978,142 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
             selected_files=selected_files or [],
         )
 
-        return final_brief
+        return self._ground_brief_in_static_context(final_brief, structural_context, dep_usage, tech_evidence)
+
+    def _ground_brief_in_static_context(
+        self,
+        brief: RepoBrief,
+        structural_context: Dict[str, Any],
+        dep_usage: Optional[Dict[str, Dict[str, Any]]] = None,
+        tech_evidence: Optional[Dict[str, List[str]]] = None,
+    ) -> RepoBrief:
+        """
+        Deterministic guardrails after LLM synthesis.
+        Ensures static facts are represented and leaves unknowns explicit instead of
+        letting schema pressure become made-up detail.
+        """
+        language_breakdown = structural_context.get("language_breakdown", {})
+        existing_tech = {item.name.lower() for item in brief.tech_stack}
+        for language, pct in language_breakdown.items():
+            if language.lower() not in existing_tech:
+                brief.tech_stack.append(
+                    TechItem(
+                        name=language,
+                        version=None,
+                        category="language",
+                        purpose=f"GitHub language analysis reports {pct}% of repository bytes.",
+                    )
+                )
+
+        if not brief.components:
+            brief.components = [
+                ComponentInfo(
+                    name=c["name"],
+                    directory=c["directory"],
+                    description=c["estimated_role"],
+                    key_files=[],
+                    depends_on=[],
+                    technologies=[c["primary_language"]],
+                )
+                for c in structural_context.get("inferred_components", [])
+            ]
+
+        if not brief.entry_points:
+            entry_paths = structural_context.get("classification", {}).get("entry_points", [])
+            brief.entry_points = [
+                FileReference(
+                    file_path=path,
+                    description="Detected by file-tree heuristics as a likely entry point; no deeper route evidence was available.",
+                )
+                for path in entry_paths[:10]
+            ]
+
+        if not brief.dependency_graph and brief.components:
+            brief.dependency_graph = {component.name: component.depends_on for component in brief.components}
+
+        brief.flagged_issues = self._filter_unsupported_flagged_issues(
+            brief.flagged_issues,
+            dep_usage or {},
+            tech_evidence or structural_context.get("tech_evidence", {}),
+        )
+
+        return brief
+
+    def _filter_unsupported_flagged_issues(
+        self,
+        issues: List[str],
+        dep_usage: Dict[str, Dict[str, Any]],
+        tech_evidence: Dict[str, List[str]],
+    ) -> List[str]:
+        """
+        High-precision issue gate.
+        The model may still over-read "not observed" as "unused"; remove issues
+        that are based on absence of evidence or contradicted by positive usage.
+        """
+        if not issues:
+            return []
+
+        observed_deps = {
+            dep.lower()
+            for dep, data in dep_usage.items()
+            if data.get("status") == "observed_used"
+        }
+        observed_tech = {tech.lower() for tech, refs in tech_evidence.items() if refs}
+
+        protected_terms = {
+            "mongodb": {"mongodb", "mongo", "mongoose", "pymongo", "motor"},
+            "redis": {"redis"},
+            "postgres": {"postgres", "postgresql", "psycopg", "asyncpg", "pgvector"},
+            "mysql": {"mysql", "mariadb"},
+            "sqlite": {"sqlite"},
+        }
+
+        absence_markers = (
+            "not used",
+            "never used",
+            "unused",
+            "declared only",
+            "not observed",
+            "not found",
+            "no code",
+            "does not use",
+            "doesn't use",
+            "readme",
+            "documentation",
+            "docs",
+        )
+
+        filtered: List[str] = []
+        for issue in issues:
+            issue_lower = issue.lower()
+
+            if any(marker in issue_lower for marker in absence_markers):
+                contradicted_by_positive_evidence = False
+                for canonical, terms in protected_terms.items():
+                    if not any(term in issue_lower for term in terms):
+                        continue
+                    has_tech_evidence = canonical in observed_tech
+                    has_dep_evidence = any(
+                        any(term in dep for term in terms)
+                        for dep in observed_deps
+                    )
+                    if has_tech_evidence or has_dep_evidence:
+                        contradicted_by_positive_evidence = True
+                        break
+
+                if contradicted_by_positive_evidence:
+                    logger.info("Removed hallucinated flagged_issue contradicted by positive evidence: %s", issue)
+                    continue
+
+                # "Not found/unused" claims are too low-confidence for flagged_issues.
+                # Keep this field for positive, actionable defects only.
+                if any(marker in issue_lower for marker in ("not used", "never used", "unused", "declared only", "not observed", "not found", "no code", "does not use", "doesn't use")):
+                    logger.info("Removed low-confidence absence-based flagged_issue: %s", issue)
+                    continue
+
+            filtered.append(issue)
+
+        return filtered
 
     # ─────────────────────────────────────────────────────────
     # Lite brief fallback (Phase 4 failed)

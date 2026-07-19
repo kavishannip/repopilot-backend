@@ -1,8 +1,11 @@
 import httpx
 import fnmatch
+import logging
 from urllib.parse import urlparse
 from app.config import settings
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 MAX_REPO_SIZE_KB = 100 * 1024  # 100 MB
 MAX_FILE_COUNT = 150  # Hard accuracy budget — do not exceed
@@ -333,6 +336,7 @@ class GitHubClient:
         }
         if settings.github_token:
             self.headers["Authorization"] = f"Bearer {settings.github_token}"
+        self._raw_download_semaphore = None
 
     def _parse_repo_url(self, repo_url: str):
         parsed = urlparse(repo_url)
@@ -476,8 +480,7 @@ class GitHubClient:
                     if not self._is_noise(path):
                         files.append(item)
 
-            prioritized_files = self._prioritize_files(files)
-            return prioritized_files[:MAX_FILE_COUNT]
+            return self._prioritize_files(files)
 
     async def get_file_tree_structure(self, repo_url: str, branch: str = None) -> Dict[str, Any]:
         """
@@ -530,12 +533,19 @@ class GitHubClient:
         # Detect project types from marker files
         detected_project_types = self._detect_project_types(all_paths)
 
+        filtered_files = [
+            item for item in tree_items
+            if item.get("type") == "blob" and not self._is_noise(item.get("path", ""))
+        ]
+
         return {
             "nested_tree": nested_tree,
             "classification": classification,
             "directory_languages": dir_languages,
             "file_sizes": file_sizes,
+            "files": self._prioritize_files(filtered_files),
             "total_files": len(all_paths),
+            "total_analyzable_files": len(filtered_files),
             "detected_project_types": detected_project_types,
         }
 
@@ -717,12 +727,10 @@ class GitHubClient:
 
         return sorted(files, key=get_score)
 
-    _raw_download_semaphore = None
-    
     async def get_file_content(self, repo_url: str, path: str, branch: str = None) -> Optional[str]:
         import asyncio
-        if not hasattr(self, "_raw_download_semaphore") or not self._raw_download_semaphore:
-            self._raw_download_semaphore = asyncio.Semaphore(2)
+        if self._raw_download_semaphore is None:
+            self._raw_download_semaphore = asyncio.Semaphore(settings.github_raw_concurrency)
             
         owner, repo = self._parse_repo_url(repo_url)
         if not branch:
@@ -768,10 +776,33 @@ class GitHubClient:
         if not branch:
             meta = await self.get_repo_metadata(repo_url)
             branch = meta["default_branch"]
+        if self._raw_download_semaphore is None:
+            self._raw_download_semaphore = asyncio.Semaphore(settings.github_raw_concurrency)
 
-        async def _fetch(path: str) -> tuple[str, Optional[str]]:
+        async def _fetch(client: httpx.AsyncClient, path: str) -> tuple[str, Optional[str]]:
             try:
-                content = await self.get_file_content(repo_url, path, branch)
+                async with self._raw_download_semaphore:
+                    resp = await client.get(
+                        f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
+                        headers=self.headers,
+                    )
+                    if resp.status_code == 200:
+                        content = resp.text
+                    elif resp.status_code in {403, 429}:
+                        retry_after = int(resp.headers.get("Retry-After", "5"))
+                        logger.warning(
+                            "Rate limited by raw.githubusercontent.com for %s. Waiting %ss...",
+                            path,
+                            retry_after,
+                        )
+                        await asyncio.sleep(retry_after)
+                        resp = await client.get(
+                            f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}",
+                            headers=self.headers,
+                        )
+                        content = resp.text if resp.status_code == 200 else None
+                    else:
+                        content = None
                 if content and len(content) > max_chars_per_file:
                     content = content[:max_chars_per_file] + "\n... [truncated]"
                 return path, content
@@ -779,5 +810,6 @@ class GitHubClient:
                 print(f"Failed to fetch {path}: {e}")
                 return path, None
 
-        results = await asyncio.gather(*(_fetch(p) for p in paths))
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            results = await asyncio.gather(*(_fetch(client, p) for p in paths))
         return {path: content for path, content in results if content}

@@ -8,6 +8,7 @@ from app.models.schema import Repository, RepoChunk
 from app.services.github_client import GitHubClient, RepoSizeExceededError, RepoTooComplexError
 from app.services.chunker import CodeChunker
 from app.services.embedding import NVIDIAEmbeddingClient
+from app.config import settings
 
 import logging
 logger = logging.getLogger(__name__)
@@ -97,9 +98,13 @@ class ProcessingPipeline:
         from app.services.repo_map import RepoMap
         ascii_tree = RepoMap().build_ascii_tree(tree_data["nested_tree"], max_depth=4)
 
-        # Raw file list (pre-prioritized, pre-noise-filtered)
-        print("Fetching file list...")
-        files = await self.github.list_files(repo_url, branch=branch)
+        # Raw file list from the already-fetched tree (pre-prioritized, pre-noise-filtered).
+        # This avoids a duplicate GitHub tree request and lets smart selection see the
+        # complete analyzable repo instead of a pre-truncated slice.
+        files = tree_data.get("files")
+        if files is None:
+            print("Fetching file list...")
+            files = await self.github.list_files(repo_url, branch=branch)
 
         # Smart file selection — may raise RepoTooComplexError
         from app.services.file_selector import SmartFileSelector
@@ -114,25 +119,19 @@ class ProcessingPipeline:
         print(f"Processing {len(files)} selected files...")
         all_chunks = []
 
-        async def fetch_and_chunk(f):
-            try:
-                content = await self.github.get_file_content(repo_url, f["path"], branch=branch)
-                if content:
-                    return self.chunker.chunk_file(f["path"], content)
-            except Exception as e:
-                import traceback
-                tb_msg = traceback.format_exc().splitlines()[-2] if traceback.format_exc().strip() else ""
-                print(f"Failed to process {f['path']}: {repr(e)} | {tb_msg}")
-            return []
-
-        # Batch size 10 — semaphore in get_file_content limits true concurrency to 2
-        batch_size = 10
-        for i in range(0, len(files), batch_size):
-            batch = files[i:i + batch_size]
-            results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
-            for file_chunks in results:
-                all_chunks.extend(file_chunks)
-            await asyncio.sleep(0.3)
+        contents = await self.github.get_files_content_batch(
+            repo_url,
+            [f["path"] for f in files],
+            branch=branch,
+            max_chars_per_file=settings.max_source_file_chars,
+        )
+        for f in files:
+            content = contents.get(f["path"])
+            if content:
+                try:
+                    all_chunks.extend(self.chunker.chunk_file(f["path"], content))
+                except Exception as e:
+                    logger.warning("Failed to chunk %s: %r", f["path"], e)
 
         print(f"Total chunks generated: {len(all_chunks)}")
 
@@ -224,3 +223,80 @@ class ProcessingPipeline:
                 })
 
             return results
+
+    async def search_chunks_by_queries(
+        self,
+        queries: List[str],
+        repo_url: str,
+        top_k: int = 5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Batch-embed multiple search queries and run per-query vector lookups.
+        This saves one external embedding request per targeted architecture query.
+        """
+        if not queries:
+            return {}
+
+        query_embeddings = await self.embedder.embed_chunks(queries, input_type="query")
+        if not query_embeddings:
+            return {query: [] for query in queries}
+
+        async with async_session() as session:
+            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
+            repo_res = await session.execute(stmt_repo)
+            repo_obj = repo_res.scalar_one_or_none()
+
+            if not repo_obj:
+                raise ValueError(f"Repository {repo_url} not found in database.")
+
+            results_by_query: Dict[str, List[Dict[str, Any]]] = {}
+            for query, q_vec in zip(queries, query_embeddings):
+                stmt = (
+                    select(RepoChunk, RepoChunk.embedding.cosine_distance(q_vec).label("distance"))
+                    .where(RepoChunk.repository_id == repo_obj.id)
+                    .order_by("distance")
+                    .limit(top_k)
+                )
+                res = await session.execute(stmt)
+                results_by_query[query] = [
+                    {
+                        "id": chunk.id,
+                        "text": chunk.chunk_text,
+                        "metadata": chunk.chunk_metadata,
+                        "distance": distance,
+                    }
+                    for chunk, distance in res
+                ]
+
+            return results_by_query
+
+    async def get_repository_chunks(
+        self,
+        repo_url: str,
+        max_text_chars_per_chunk: int = 2000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return all stored chunks for a processed repo.
+        Used by deterministic static analysis so absence from semantic search does
+        not become a false "unused dependency" or README contradiction.
+        """
+        async with async_session() as session:
+            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
+            repo_res = await session.execute(stmt_repo)
+            repo_obj = repo_res.scalar_one_or_none()
+
+            if not repo_obj:
+                raise ValueError(f"Repository {repo_url} not found in database.")
+
+            stmt = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
+            res = await session.execute(stmt)
+            chunks = res.scalars().all()
+
+            return [
+                {
+                    "id": chunk.id,
+                    "text": chunk.chunk_text[:max_text_chars_per_chunk],
+                    "metadata": chunk.chunk_metadata or {},
+                }
+                for chunk in chunks
+            ]
