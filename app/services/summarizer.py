@@ -699,6 +699,21 @@ STRICT RULES:
 - If highly uncertain about a specific detail, state your assumption in flagged_issues rather than leaving the field blank.
 - JSON SCHEMA COMPLIANCE: You must strictly adhere to the provided schema. Do NOT output a blank or empty JSON skeleton. EVERY string field must contain a detailed description (minimum 2 sentences). EVERY list field must contain all relevant items found in the context.
 - NO MARKDOWN REPORTS: You must return the results SOLELY by populating the provided JSON/function schema. Do NOT write a markdown report or table. ALL information must be placed inside the schema fields.
+- LIST POPULATION MANDATE: You MUST populate arrays correctly. Do NOT cram component or tech stack lists into the `summary` or `architecture_summary` strings. Use the proper `components` and `tech_stack` arrays.
+- JSON TEMPLATE EXPECTATION: Your JSON must strictly mirror this structure:
+```json
+{
+  "tech_stack": [{"name": "React", "version": "18", "category": "framework", "purpose": "UI"}],
+  "architecture_summary": "Detailed string here...",
+  "entry_points": [{"file_path": "main.py", "description": "Entry"}],
+  "flagged_issues": ["Issue 1"],
+  "summary": "High-level summary here...",
+  "components": [{"name": "backend", "directory": "api/", "description": "...", "key_files": ["api/routes.py"], "depends_on": [], "technologies": ["FastAPI"]}],
+  "data_flow": "String describing flow...",
+  "detected_patterns": ["MVC"],
+  "dependency_graph": {"backend": ["database"]}
+}
+```
 - LANGUAGE BREAKDOWN is from GitHub's byte-count analysis — treat as GROUND TRUTH for tech_stack. Every language listed MUST appear in tech_stack. Do not omit languages visible in the breakdown.
 - DIRECTORY STRUCTURE is complete — use it to identify ALL components. Every top-level directory with source code is a potential component.
 - key_files: for each component, list at least 2-3 files from the directory structure that appear architecturally significant (entry points, configs, main files).
