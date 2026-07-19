@@ -73,9 +73,20 @@ class RepoBrief(LLMRepoBrief):
     )
     repo_metadata: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Repository metadata (license, latest release, contributors, etc.)"
+        description=(
+            "All GitHub API metadata: stars, forks, watchers, open_issues, topics, homepage, "
+            "license, created_at, updated_at, pushed_at, visibility, is_fork, archived, "
+            "contributors_count, latest_release, size_kb, has_wiki, has_discussions, etc."
+        )
+    )
+    project_types: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Detected project type markers from the file tree, e.g. ['Python', 'Django', 'Docker', 'Monorepo']. "
+            "Derived from PROJECT_TYPE_MARKERS heuristics — not LLM-generated."
+        )
     )
     selected_files: List[str] = Field(
         default_factory=list,
-        description="List of files that were selected as architecturally significant and used for deep analysis."
+        description="Files selected as architecturally significant and used for deep analysis."
     )

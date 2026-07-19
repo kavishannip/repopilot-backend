@@ -1,13 +1,17 @@
 import asyncio
 from sqlalchemy.future import select
 from sqlalchemy import delete
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from app.database import async_session
 from app.models.schema import Repository, RepoChunk
-from app.services.github_client import GitHubClient, RepoSizeExceededError
+from app.services.github_client import GitHubClient, RepoSizeExceededError, RepoTooComplexError
 from app.services.chunker import CodeChunker
 from app.services.embedding import NVIDIAEmbeddingClient
+
+import logging
+logger = logging.getLogger(__name__)
+
 
 class ProcessingPipeline:
     def __init__(self):
@@ -18,45 +22,45 @@ class ProcessingPipeline:
     async def process_repo(self, repo_url: str) -> Dict[str, Any]:
         """
         Process a repository: fetch, chunk, embed, store.
-        Returns stats about the process.
+        Returns stats including selected_files and cached tree_data for the summarizer
+        (avoids a second get_file_tree_structure() call).
+
+        Raises:
+            RepoSizeExceededError  — raw repo too large (KB)
+            RepoTooComplexError    — important files exceed accuracy budget
         """
         print(f"Fetching metadata for {repo_url}...")
         meta = await self.github.get_repo_metadata(repo_url)
         branch = meta["default_branch"]
-        
-        # We need the commit SHA of the default branch to check cache
-        # For simplicity, if we don't have it directly from meta, we can get it from branch ref
+
         commit_sha = await self._get_branch_commit(repo_url, branch)
-        
+
         async with async_session() as session:
-            # Check cache
             stmt = select(Repository).where(Repository.repo_url == repo_url)
             result = await session.execute(stmt)
             repo_obj = result.scalar_one_or_none()
-            
+
             if repo_obj and repo_obj.commit_sha == commit_sha:
                 print("Cache hit! Repository is up to date.")
-                # Return counts
                 stmt_count = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
                 res = await session.execute(stmt_count)
                 chunks = res.scalars().all()
-                
-                # Extract unique files that were actually chunked
+
                 selected_paths = set()
                 for c in chunks:
                     path = c.chunk_metadata.get("path")
                     if path:
                         selected_paths.add(path)
-                        
+
                 return {
                     "status": "cached",
                     "repo_url": repo_url,
                     "commit_sha": commit_sha,
                     "chunks_count": len(chunks),
-                    "selected_files": list(selected_paths)
+                    "selected_files": list(selected_paths),
+                    "tree_data": None,  # not re-fetched on cache hit; summarizer will fetch its own
                 }
 
-            # If it exists but different commit, update. If not exists, create.
             if not repo_obj:
                 repo_obj = Repository(
                     repo_url=repo_url,
@@ -74,79 +78,82 @@ class ProcessingPipeline:
                 repo_obj.language = meta["language"]
                 repo_obj.stars = meta["stars"]
                 repo_obj.description = meta["description"]
-                
-                # Delete old chunks
+
+                # Delete stale chunks
                 await session.execute(delete(RepoChunk).where(RepoChunk.repository_id == repo_obj.id))
-            
+
             await session.commit()
             repo_id = repo_obj.id
 
-        # --- OUTSIDE DB TRANSACTION: Heavy I/O and processing ---
-        
-        # Now fetch files
-        print("Fetching file list...")
-        files = await self.github.list_files(repo_url)
-        
-        # Apply smart file selection to reduce chunks
-        from app.services.file_selector import SmartFileSelector
-        selector = SmartFileSelector()
+        # ── Outside DB transaction: heavy I/O ──────────────────────────────
+
+        # Single tree fetch — result shared with summarizer to avoid duplicate API call
+        print("Fetching file tree...")
         tree_data = await self.github.get_file_tree_structure(repo_url, branch)
         classification = tree_data["classification"]
-        
-        # Build ASCII tree manually for selector (since repo_map requires full pass)
+        file_sizes = tree_data.get("file_sizes", {})
+
+        # Build ASCII tree for SmartFileSelector prompt
         from app.services.repo_map import RepoMap
         ascii_tree = RepoMap().build_ascii_tree(tree_data["nested_tree"], max_depth=4)
-        
-        files = await selector.select_files(files, classification, ascii_tree)
-        
+
+        # Raw file list (pre-prioritized, pre-noise-filtered)
+        print("Fetching file list...")
+        files = await self.github.list_files(repo_url, branch=branch)
+
+        # Smart file selection — may raise RepoTooComplexError
+        from app.services.file_selector import SmartFileSelector
+        selector = SmartFileSelector()
+        files = await selector.select_files(
+            all_files=files,
+            classification=classification,
+            ascii_tree=ascii_tree,
+            file_sizes=file_sizes,
+        )
+
+        print(f"Processing {len(files)} selected files...")
         all_chunks = []
-        
-        print(f"Processing {len(files)} files...")
-        
+
         async def fetch_and_chunk(f):
             try:
-                content = await self.github.get_file_content(repo_url, f["path"])
+                content = await self.github.get_file_content(repo_url, f["path"], branch=branch)
                 if content:
                     return self.chunker.chunk_file(f["path"], content)
             except Exception as e:
                 import traceback
                 tb_msg = traceback.format_exc().splitlines()[-2] if traceback.format_exc().strip() else ""
-                print(f"Failed to process {f['path']}: {repr(e)} | Details: {tb_msg}")
+                print(f"Failed to process {f['path']}: {repr(e)} | {tb_msg}")
             return []
-            
-        batch_size = 5
+
+        # Batch size 10 — semaphore in get_file_content limits true concurrency to 2
+        batch_size = 10
         for i in range(0, len(files), batch_size):
-            batch = files[i:i+batch_size]
+            batch = files[i:i + batch_size]
             results = await asyncio.gather(*(fetch_and_chunk(f) for f in batch))
             for file_chunks in results:
                 all_chunks.extend(file_chunks)
-            await asyncio.sleep(0.5)
-                
+            await asyncio.sleep(0.3)
+
         print(f"Total chunks generated: {len(all_chunks)}")
-        
+
         # Batch embedding
         embeddings = []
         if all_chunks:
             texts = [c["text"] for c in all_chunks]
             print(f"Embedding {len(texts)} chunks...")
             embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
-            
-        # --- NEW DB TRANSACTION: Save chunks ---
+
+        # Save chunks
         async with async_session() as session:
             if all_chunks and embeddings:
                 print("Saving to database...")
                 db_chunks = []
                 for i, c in enumerate(all_chunks):
                     clean_text = c["text"].replace("\x00", "")
-                    
-                    # Clean metadata just in case (as it gets serialized to JSONB)
-                    clean_metadata = {}
-                    for k, v in c["metadata"].items():
-                        if isinstance(v, str):
-                            clean_metadata[k] = v.replace("\x00", "")
-                        else:
-                            clean_metadata[k] = v
-                            
+                    clean_metadata = {
+                        k: v.replace("\x00", "") if isinstance(v, str) else v
+                        for k, v in c["metadata"].items()
+                    }
                     db_chunks.append(
                         RepoChunk(
                             repository_id=repo_id,
@@ -156,18 +163,20 @@ class ProcessingPipeline:
                         )
                     )
                 session.add_all(db_chunks)
-                
+
             await session.commit()
             print("Done processing repository.")
-            
+
+            selected_file_paths = [f["path"] for f in files]
             return {
                 "status": "processed",
                 "repo_url": repo_url,
                 "commit_sha": commit_sha,
                 "chunks_count": len(all_chunks),
-                "selected_files": [f["path"] for f in files]
+                "selected_files": selected_file_paths,
+                "tree_data": tree_data,   # passed to summarizer to skip second fetch
             }
-            
+
     async def _get_branch_commit(self, repo_url: str, branch: str) -> str:
         owner, repo = self.github._parse_repo_url(repo_url)
         import httpx
@@ -183,31 +192,27 @@ class ProcessingPipeline:
         """
         Embed a search query and find most similar chunks for a specific repo.
         """
-        # Embed query
         query_embedding = await self.embedder.embed_chunks([query], input_type="query")
         if not query_embedding:
             return []
-        
+
         q_vec = query_embedding[0]
-        
+
         async with async_session() as session:
-            # First find the repository id
             stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
             repo_res = await session.execute(stmt_repo)
             repo_obj = repo_res.scalar_one_or_none()
-            
+
             if not repo_obj:
                 raise ValueError(f"Repository {repo_url} not found in database.")
-                
-            # Perform similarity search using pgvector's cosine distance `<=>`
-            # We want to order by similarity (ascending cosine distance)
+
             stmt = (
                 select(RepoChunk, RepoChunk.embedding.cosine_distance(q_vec).label("distance"))
                 .where(RepoChunk.repository_id == repo_obj.id)
                 .order_by("distance")
                 .limit(top_k)
             )
-            
+
             res = await session.execute(stmt)
             results = []
             for chunk, distance in res:
@@ -217,5 +222,5 @@ class ProcessingPipeline:
                     "metadata": chunk.chunk_metadata,
                     "distance": distance
                 })
-                
+
             return results

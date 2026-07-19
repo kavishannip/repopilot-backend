@@ -10,7 +10,7 @@ from sqlalchemy.future import select
 from app.models.schema import Repository
 from app.services.summarizer import RepoSummarizer
 from app.models.brief import RepoBrief
-from app.services.github_client import RepoSizeExceededError
+from app.services.github_client import RepoSizeExceededError, RepoTooComplexError
 from app.services.job_manager import job_manager
 from app.config import settings
 
@@ -53,13 +53,14 @@ def is_valid_github_url(url: str) -> bool:
 async def _run_pipeline(job_id: str, repo_url: str) -> None:
     """
     Background task: runs full analysis pipeline, writes result/error to DB job row.
-    Designed to be fire-and-forget via asyncio.create_task().
     """
     try:
         brief = await summarizer.generate_brief(repo_url, job_id=job_id)
         await job_manager.complete_job(job_id, brief.model_dump())
     except RepoSizeExceededError as e:
         await job_manager.fail_job(job_id, f"Repo too large: {e}")
+    except RepoTooComplexError as e:
+        await job_manager.fail_job(job_id, f"Repo too complex for accurate analysis: {e}")
     except Exception as e:
         logger.exception(f"[Job {job_id[:8]}] pipeline error")
         await job_manager.fail_job(job_id, str(e))
@@ -87,6 +88,14 @@ async def analyze_repo(req: AnalyzeRequest):
         commit_sha = await summarizer.pipeline._get_branch_commit(repo_url, branch)
     except RepoSizeExceededError as e:
         raise HTTPException(status_code=400, detail=f"Repo exceeds size limit. {e}")
+    except RepoTooComplexError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Repository too complex for accurate analysis. {e} "
+                "Please try a focused sub-directory or a smaller repository."
+            )
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch repo metadata: {e}")
 

@@ -24,7 +24,9 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
-
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import ValidationError
+from app.models.schema import Repository
 from app.models.brief import RepoBrief, LLMRepoBrief, ComponentInfo, TechItem, FileReference
 from app.services.llm import get_fast_llm, get_reasoning_llm
 from app.services.pipeline import ProcessingPipeline
@@ -33,7 +35,6 @@ from app.services.github_client import GitHubClient
 from app.config import settings
 from app.database import async_session
 from sqlalchemy.future import select
-from app.models.schema import Repository
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,6 @@ class RepoSummarizer:
         self.fast_llm = get_fast_llm()
         # Phase 4: NVIDIA NIM (reasoning, structured output)
         self.reasoning_llm = get_reasoning_llm()
-        self.reasoning_llm_structured = get_reasoning_llm().with_structured_output(LLMRepoBrief)
         self.pipeline = ProcessingPipeline()
         self.repo_map_builder = RepoMap()
         self.github = GitHubClient()
@@ -240,6 +240,8 @@ class RepoSummarizer:
         print("\n[Pass 0] Embedding repository chunks...")
         process_stats = await self.pipeline.process_repo(repo_url)
         commit_sha = process_stats["commit_sha"]
+        # tree_data from process_repo (avoids a second get_file_tree_structure() call)
+        cached_tree_data = process_stats.get("tree_data")  # None on cache hit
         print(f"  Status: {process_stats['status']}, chunks: {process_stats.get('chunks_count', '?')}, "
               f"duration: {time.time()-t0:.1f}s")
 
@@ -247,7 +249,7 @@ class RepoSummarizer:
         await set_phase("structural_map")
         t1 = time.time()
         print("\n[Pass 1] Building structural map and reading key files...")
-        structural_context = await self._build_structural_context(repo_url)
+        structural_context = await self._build_structural_context(repo_url, tree_data=cached_tree_data)
         print(f"  Done in {time.time()-t1:.1f}s")
 
         # ── Pass 2: Targeted similarity search ────────────────────────
@@ -295,7 +297,8 @@ class RepoSummarizer:
                 group_summaries=group_summaries,
                 dep_usage=dep_usage,
                 env_vars=env_vars,
-                selected_files=process_stats.get("selected_files", [])
+                selected_files=process_stats.get("selected_files", []),
+                project_types=structural_context.get("project_types", []),
             )
             print(f"  Done in {time.time()-t4:.1f}s")
         except Exception as e:
@@ -313,16 +316,29 @@ class RepoSummarizer:
     # Pass 1: Structural map + full critical file reads
     # ─────────────────────────────────────────────────────────
 
-    async def _build_structural_context(self, repo_url: str) -> Dict[str, Any]:
-        """Fetch file tree, classify files, read critical/entry/config files in full. No LLM."""
+    async def _build_structural_context(
+        self,
+        repo_url: str,
+        tree_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fetch file tree, classify files, read critical/entry/config files in full. No LLM.
+        Accepts optional pre-fetched tree_data from ProcessingPipeline to avoid duplicate API call.
+        """
         enriched_data = await self.github.get_repo_enriched_metadata(repo_url)
         meta = enriched_data["meta"]
         branch = meta["default_branch"]
 
-        tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+        # Reuse tree_data if provided (already fetched by ProcessingPipeline)
+        if tree_data is None:
+            print("  [Pass 1] Fetching file tree (not cached from pipeline)...")
+            tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+        else:
+            print("  [Pass 1] Reusing file tree from pipeline (no duplicate fetch).")
+
         classification = tree_data["classification"]
         dir_languages = tree_data["directory_languages"]
         nested_tree = tree_data["nested_tree"]
+        project_types = tree_data.get("detected_project_types", [])
 
         print(f"  Files classified: "
               f"critical={len(classification['critical'])}, "
@@ -330,6 +346,8 @@ class RepoSummarizer:
               f"config={len(classification['config'])}, "
               f"source={len(classification['source'])}, "
               f"docs={len(classification['docs'])}")
+        if project_types:
+            print(f"  Detected project types: {project_types}")
 
         files_to_read = (
             classification["critical"][:10] +
@@ -373,17 +391,44 @@ class RepoSummarizer:
         inferred_components = self.repo_map_builder.build_component_names(classification, dir_languages)
         manifest_text = self.repo_map_builder.format_dependencies_for_llm(parsed_manifests)
 
+        # Full repo_metadata — all GitHub fields surfaced to the response
+        repo_metadata = {
+            # Core identity
+            "full_name": meta.get("full_name", ""),
+            "description": meta.get("description", ""),
+            "homepage": meta.get("homepage", ""),
+            "topics": meta.get("topics", []),
+            # Popularity
+            "stars": meta.get("stars", 0),
+            "watchers": meta.get("watchers", 0),
+            "forks": meta.get("forks", 0),
+            "open_issues": meta.get("open_issues", 0),
+            "network_count": meta.get("network_count", 0),
+            # Provenance
+            "license": meta.get("license", "None"),
+            "visibility": meta.get("visibility", "public"),
+            "archived": meta.get("archived", False),
+            "is_fork": meta.get("is_fork", False),
+            "parent_repo": meta.get("parent_repo"),
+            "has_wiki": meta.get("has_wiki", False),
+            "has_discussions": meta.get("has_discussions", False),
+            # Dates
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "pushed_at": meta.get("pushed_at", ""),
+            # Size
+            "size_kb": meta.get("size_kb", 0),
+            "primary_language": meta.get("language", ""),
+            # Enriched
+            "contributors_count": enriched_data.get("contributors_count", 0),
+            "latest_release": enriched_data.get("latest_release", "None"),
+        }
+
         return {
             "meta": meta,
             "language_breakdown": enriched_data["language_breakdown"],
-            "repo_metadata": {
-                "license": meta.get("license", "None"),
-                "created_at": meta.get("created_at", ""),
-                "latest_release": enriched_data.get("latest_release", "None"),
-                "contributors_count": enriched_data.get("contributors_count", 0),
-                "forks": meta.get("forks", 0),
-                "archived": meta.get("archived", False),
-            },
+            "repo_metadata": repo_metadata,
+            "project_types": project_types,
             "branch": branch,
             "classification": classification,
             "dir_languages": dir_languages,
@@ -590,6 +635,7 @@ class RepoSummarizer:
         dep_usage: Dict[str, str],
         env_vars: Dict[str, List[str]],
         selected_files: List[str] = None,
+        project_types: List[str] = None,
     ) -> RepoBrief:
         """
         Combine all context and produce the final RepoBrief.
@@ -604,6 +650,7 @@ class RepoSummarizer:
         detected_frameworks = structural_context["detected_frameworks"]
         full_file_contents = structural_context["full_file_contents"]
         inferred_components = structural_context["inferred_components"]
+        project_types = project_types or structural_context.get("project_types", [])
 
         critical_files_text = self._format_critical_files(
             structural_context["classification"],
@@ -625,6 +672,7 @@ class RepoSummarizer:
         
         dep_usage_text = _format_dep_usage(dep_usage)
         env_vars_text = _format_env_vars(env_vars)
+        project_types_text = ", ".join(project_types) if project_types else "Not detected"
 
         system_prompt = """You are an expert software architect producing a comprehensive repository brief.
 You have been given:
@@ -647,8 +695,10 @@ STRICT RULES:
 - Dependencies: use the STATIC ANALYSIS section for declared vs. used. Do not guess from manifest alone.
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
-- STRICT ANTI-HALLUCINATION RULE: You must ONLY use information explicitly present in the provided context. If the context does not contain enough information to accurately populate a field, you MUST output 'Not available' (for strings) or an empty list/object (for arrays/dicts). Do NOT guess, infer, or fabricate any details, names, or versions.
-- If uncertain, say so in flagged_issues.
+- SYNTHESIZE CONFIDENTLY: The provided context contains everything you need. Synthesize the snippets, summaries, and structural maps to comprehensively fill out EVERY field. NEVER leave a field empty or output an empty list/object. If a specific detail is missing, infer the most likely architectural pattern based on standard practices for the detected frameworks.
+- If highly uncertain about a specific detail, state your assumption in flagged_issues rather than leaving the field blank.
+- JSON SCHEMA COMPLIANCE: You must strictly adhere to the provided schema. Do NOT output a blank or empty JSON skeleton. EVERY string field must contain a detailed description (minimum 2 sentences). EVERY list field must contain all relevant items found in the context.
+- NO MARKDOWN REPORTS: You must return the results SOLELY by populating the provided JSON/function schema. Do NOT write a markdown report or table. ALL information must be placed inside the schema fields.
 - LANGUAGE BREAKDOWN is from GitHub's byte-count analysis — treat as GROUND TRUTH for tech_stack. Every language listed MUST appear in tech_stack. Do not omit languages visible in the breakdown.
 - DIRECTORY STRUCTURE is complete — use it to identify ALL components. Every top-level directory with source code is a potential component.
 - key_files: for each component, list at least 2-3 files from the directory structure that appear architecturally significant (entry points, configs, main files).
@@ -661,6 +711,9 @@ GitHub metadata:
   - Stars: {meta.get('stars', 0)}
   - Description: {meta.get('description', 'No description')}
   - Topics: {', '.join(meta.get('topics', []))}
+
+=== DETECTED PROJECT TYPES (from file tree markers — treat as ground truth) ===
+{project_types_text}
 
 === GITHUB REPOSITORY METADATA (verified) ===
 {meta_text}
@@ -697,13 +750,34 @@ GitHub metadata:
 
 Now produce the complete RepoBrief with ALL fields populated accurately."""
 
+        parser = PydanticOutputParser(pydantic_object=LLMRepoBrief)
+        format_instructions = parser.get_format_instructions()
+        
+        system_prompt += f"\n\n{format_instructions}"
+
         print(f"  Calling NVIDIA reasoning LLM ({settings.repo_analizer_model}, thinking={settings.llm_enable_thinking})...")
         t_start = time.time()
 
-        brief = await self.reasoning_llm_structured.ainvoke([
+        res = await self.reasoning_llm.ainvoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
         ])
+        
+        try:
+            brief = parser.invoke(res)
+        except Exception as e:
+            # Fallback if parser fails due to cut-off or weird format
+            print(f"  [Pass 4] Parse warning: {e}. Trying raw json extraction...")
+            import json
+            import re
+            match = re.search(r'\{.*\}', res.content, re.DOTALL)
+            if match:
+                try:
+                    brief = LLMRepoBrief.model_validate_json(match.group(0))
+                except Exception as inner_e:
+                    raise ValueError(f"Failed to parse LLM JSON: {inner_e}")
+            else:
+                raise ValueError("No JSON object found in LLM output")
 
         duration = time.time() - t_start
         print(f"  [Pass 4] NVIDIA synthesis: {duration:.1f}s")
@@ -711,11 +785,12 @@ Now produce the complete RepoBrief with ALL fields populated accurately."""
         # Convert LLMRepoBrief to full RepoBrief, injecting static analysis
         final_brief = RepoBrief(
             **brief.model_dump(),
-            directory_structure=ascii_tree, # Provide full ascii tree to frontend without truncation
+            directory_structure=ascii_tree,
             framework_details=detected_frameworks,
             language_breakdown=language_breakdown,
             repo_metadata=repo_metadata,
-            selected_files=selected_files or []
+            project_types=project_types,
+            selected_files=selected_files or [],
         )
 
         return final_brief
