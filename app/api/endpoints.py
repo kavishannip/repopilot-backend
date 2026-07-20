@@ -100,9 +100,10 @@ async def analyze_repo(req: AnalyzeRequest):
 
     # 1. Validate repo + get commit SHA (fast, synchronous-ish)
     try:
-        meta = await summarizer.github.get_repo_metadata(repo_url)
+        github = await summarizer.pipeline.get_github_client(repo_url)
+        meta = await github.get_repo_metadata(repo_url)
         branch = meta["default_branch"]
-        commit_sha = await summarizer.pipeline._get_branch_commit(repo_url, branch)
+        commit_sha = await summarizer.pipeline._get_branch_commit(github, repo_url, branch)
     except RepoSizeExceededError as e:
         raise HTTPException(status_code=400, detail=f"Repo exceeds size limit. {e}")
     except RepoTooComplexError as e:

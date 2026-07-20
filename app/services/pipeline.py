@@ -18,9 +18,27 @@ logger = logging.getLogger(__name__)
 
 class ProcessingPipeline:
     def __init__(self):
-        self.github = GitHubClient()
         self.chunker = CodeChunker()
         self.embedder = NVIDIAEmbeddingClient()
+        
+    async def get_github_client(self, repo_url: str) -> GitHubClient:
+        from app.database import async_session
+        from sqlalchemy.future import select
+        from app.models.schema import GithubInstallation
+        
+        # We need a dummy client just to parse the URL
+        dummy = GitHubClient()
+        owner, _ = dummy._parse_repo_url(repo_url)
+        
+        async with async_session() as session:
+            stmt = select(GithubInstallation).where(GithubInstallation.account_name == owner)
+            result = await session.execute(stmt)
+            install = result.scalar_one_or_none()
+            if install:
+                from app.services.github_auth import github_auth
+                token = await github_auth.get_installation_token(install.installation_id)
+                return GitHubClient(installation_token=token)
+        return GitHubClient()
 
     async def process_repo(self, repo_url: str) -> Dict[str, Any]:
         """
@@ -32,11 +50,13 @@ class ProcessingPipeline:
             RepoSizeExceededError  — raw repo too large (KB)
             RepoTooComplexError    — important files exceed accuracy budget
         """
+        github = await self.get_github_client(repo_url)
+        
         print(f"Fetching metadata for {repo_url}...")
-        meta = await self.github.get_repo_metadata(repo_url)
+        meta = await github.get_repo_metadata(repo_url)
         branch = meta["default_branch"]
 
-        commit_sha = await self._get_branch_commit(repo_url, branch)
+        commit_sha = await self._get_branch_commit(github, repo_url, branch)
 
         async with async_session() as session:
             # --- LRU Cache Eviction ---
@@ -110,7 +130,7 @@ class ProcessingPipeline:
 
         # Single tree fetch — result shared with summarizer to avoid duplicate API call
         print("Fetching file tree...")
-        tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+        tree_data = await github.get_file_tree_structure(repo_url, branch)
         classification = tree_data["classification"]
         file_sizes = tree_data.get("file_sizes", {})
 
@@ -124,7 +144,7 @@ class ProcessingPipeline:
         all_files = tree_data.get("files")
         if all_files is None:
             print("Fetching file list...")
-            all_files = await self.github.list_files(repo_url, branch=branch)
+            all_files = await github.list_files(repo_url, branch=branch)
 
         # Smart file selection — may raise RepoTooComplexError
         from app.services.file_selector import SmartFileSelector
@@ -151,7 +171,7 @@ class ProcessingPipeline:
             ))
         ]
         
-        scan_contents = await self.github.get_files_content_batch(
+        scan_contents = await github.get_files_content_batch(
             repo_url,
             [f["path"] for f in scan_files[:3000]],
             branch=branch,
@@ -163,7 +183,7 @@ class ProcessingPipeline:
         print(f"Processing {len(selected_files)} selected files for deep embedding...")
         all_chunks = []
 
-        contents = await self.github.get_files_content_batch(
+        contents = await github.get_files_content_batch(
             repo_url,
             [f["path"] for f in selected_files],
             branch=branch,
@@ -226,13 +246,13 @@ class ProcessingPipeline:
                 "tree_data": tree_data,   # passed to summarizer to skip second fetch
             }
 
-    async def _get_branch_commit(self, repo_url: str, branch: str) -> str:
-        owner, repo = self.github._parse_repo_url(repo_url)
+    async def _get_branch_commit(self, github: GitHubClient, repo_url: str, branch: str) -> str:
+        owner, repo = github._parse_repo_url(repo_url)
         import httpx
         async with httpx.AsyncClient(follow_redirects=True) as client:
             resp = await client.get(
                 f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}",
-                headers=self.github.headers
+                headers=github.headers
             )
             resp.raise_for_status()
             return resp.json()["sha"]
