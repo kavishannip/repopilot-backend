@@ -144,7 +144,11 @@ class ProcessingPipeline:
         scanner = StructuralScanner()
         scan_files = [
             f for f in all_files 
-            if f.get("type", "file") == "file" and f["path"].endswith((".py", ".ts", ".tsx", ".js", ".jsx"))
+            if f.get("type", "file") in ("file", "blob") and f["path"].endswith((
+                ".py", ".ts", ".tsx", ".js", ".jsx", 
+                ".go", ".java", ".kt", ".rs", ".c", ".cpp", ".h", ".hpp", 
+                ".cs", ".rb", ".php", ".swift", ".m"
+            ))
         ]
         
         scan_contents = await self.github.get_files_content_batch(

@@ -5,8 +5,13 @@ import uuid
 
 # Very basic regexes for import extraction. Not meant to be a full AST parser,
 # but enough for a fast lightweight scan.
-PYTHON_IMPORT_RE = re.compile(r'^(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))', re.MULTILINE)
-TS_JS_IMPORT_RE = re.compile(r'import\s+(?:.*?\s+from\s+)?[\'"]([^\'"]+)[\'"]', re.MULTILINE)
+PYTHON_IMPORT_RE = re.compile(r'^\s*(?:from\s+([a-zA-Z0-9_\.]+)\s+import|import\s+([a-zA-Z0-9_\.]+))', re.MULTILINE)
+TS_JS_IMPORT_RE = re.compile(r'(?:import\s+(?:.*?\s+from\s+)?|import\(\s*|require\(\s*)[\'"]([^\'"]+)[\'"]', re.MULTILINE)
+JAVA_CS_SWIFT_RE = re.compile(r'^\s*(?:import|using)\s+([a-zA-Z0-9_\.]+)', re.MULTILINE)
+RUST_RE = re.compile(r'^\s*(?:use|mod)\s+([a-zA-Z0-9_:]+)', re.MULTILINE)
+C_CPP_RE = re.compile(r'^\s*#include\s*[<"]([^>"]+)[>"]', re.MULTILINE)
+PHP_RUBY_RE = re.compile(r'^\s*(?:require|require_relative|require_once|include|include_once|use)\s*[\'"]([^\'"]+)[\'"]', re.MULTILINE)
+GO_RE = re.compile(r'^\s*(?:import\s+)?(?:[a-zA-Z0-9_]+\s+)?[\'"]([^\'"]+)[\'"]', re.MULTILINE)
 
 class StructuralScanner:
     """
@@ -36,6 +41,27 @@ class StructuralScanner:
                 module = match.group(1)
                 if module:
                     imports.append(module)
+        elif path.endswith((".java", ".cs", ".swift", ".kt")):
+            for match in JAVA_CS_SWIFT_RE.finditer(content):
+                m = match.group(1)
+                if m: imports.append(m)
+        elif path.endswith(".rs"):
+            for match in RUST_RE.finditer(content):
+                m = match.group(1)
+                if m: imports.append(m)
+        elif path.endswith((".c", ".cpp", ".h", ".hpp", ".m")):
+            for match in C_CPP_RE.finditer(content):
+                m = match.group(1)
+                if m: imports.append(m)
+        elif path.endswith((".php", ".rb")):
+            for match in PHP_RUBY_RE.finditer(content):
+                m = match.group(1)
+                if m: imports.append(m)
+        elif path.endswith(".go"):
+            if "import" in content:
+                for match in GO_RE.finditer(content):
+                    m = match.group(1)
+                    if m: imports.append(m)
         return imports
 
     def scan(
@@ -51,54 +77,24 @@ class StructuralScanner:
         nodes: Dict[str, GraphNode] = {}
         edges: List[GraphEdge] = []
 
-        # 1. Create nodes for all folders and files
+        # 1. Create nodes ONLY for actual files
         for f in all_files[:self.max_files]:
             path = f["path"]
-            is_file = f.get("type", "file") == "file" or "." in path.split("/")[-1]
+            is_file = f.get("type", "file") in ("file", "blob") or "." in path.split("/")[-1]
             
-            # Create node for the file
+            if not is_file:
+                continue
+                
             node_id = uuid.uuid4()
             nodes[path] = GraphNode(
                 id=node_id,
                 repository_id=repository_id,
                 path=path,
-                type="file" if is_file else "folder",
+                type="file",
                 deep_analysis=(path in selected_paths)
             )
-
-            # Create nodes for parent folders and 'contains' edges
-            parts = path.split("/")
-            for i in range(1, len(parts)):
-                folder_path = "/".join(parts[:i])
-                if folder_path not in nodes:
-                    folder_id = uuid.uuid4()
-                    nodes[folder_path] = GraphNode(
-                        id=folder_id,
-                        repository_id=repository_id,
-                        path=folder_path,
-                        type="folder",
-                        deep_analysis=False
-                    )
-                
-                # edge from parent folder to this item (folder or file)
-                # the item path is "/".join(parts[:i+1])
-                child_path = "/".join(parts[:i+1])
-                # We will add edges in a second pass or check if we already added it
         
-        # Build contains edges
-        for path, node in nodes.items():
-            if "/" in path:
-                parent_path = path.rsplit("/", 1)[0]
-                if parent_path in nodes:
-                    edges.append(
-                        GraphEdge(
-                            id=uuid.uuid4(),
-                            repository_id=repository_id,
-                            source_node_id=nodes[parent_path].id,
-                            target_node_id=node.id,
-                            type="contains"
-                        )
-                    )
+        # 'contains' edges removed to save space and focus entirely on code dependencies.
 
         # 2. Parse imports and create 'imports' edges
         for path, content in file_contents.items():
@@ -146,11 +142,51 @@ class StructuralScanner:
                                 break
                     else:
                         # absolute/alias imports like 'src/components/xyz' or bare modules (ignore bare)
-                        # just try direct match
-                        for ext in [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js", ""]:
-                            if f"{raw_import}{ext}" in nodes:
-                                target_path = f"{raw_import}{ext}"
+                        clean_import = raw_import
+                        
+                        # Strip common framework aliases (Vue, Svelte, Next, Nuxt)
+                        for alias in ["@/", "~/", "$/", "@app/"]:
+                            if clean_import.startswith(alias):
+                                clean_import = clean_import[len(alias):]
                                 break
+
+                        # try direct match or prefixing with common root dirs
+                        for ext in [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js", ""]:
+                            for base in ["", "src/", "app/", "lib/", "frontend/", "backend/"]:
+                                test_path = f"{base}{clean_import}{ext}"
+                                if test_path in nodes:
+                                    target_path = test_path
+                                    break
+                            if target_path:
+                                break
+                else:
+                    # Generic best-effort path mapping for other languages
+                    clean_import = raw_import.replace(".", "/").replace("::", "/")
+                    
+                    test_exts = [""]
+                    if path.endswith(".java"): test_exts = [".java"]
+                    elif path.endswith(".cs"): test_exts = [".cs"]
+                    elif path.endswith(".swift"): test_exts = [".swift"]
+                    elif path.endswith(".kt"): test_exts = [".kt"]
+                    elif path.endswith(".rs"): test_exts = [".rs"]
+                    elif path.endswith((".c", ".cpp", ".h", ".hpp", ".m")): test_exts = ["", ".h", ".hpp", ".c", ".cpp", ".m"]
+                    elif path.endswith(".php"): test_exts = [".php"]
+                    elif path.endswith(".rb"): test_exts = [".rb"]
+                    elif path.endswith(".go"): test_exts = [".go", "/"]
+
+                    for ext in test_exts:
+                        test_suffix = f"{clean_import}{ext}"
+                        if test_suffix in nodes:
+                            target_path = test_suffix
+                            break
+                        
+                        # suffix check over all nodes (efficient enough for <3000 files)
+                        for n_path in nodes:
+                            if n_path.endswith(f"/{test_suffix}") or n_path == test_suffix:
+                                target_path = n_path
+                                break
+                        if target_path:
+                            break
 
                 if target_path and target_path in nodes:
                     edges.append(
