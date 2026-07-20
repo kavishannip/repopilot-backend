@@ -372,20 +372,28 @@ class RepoSummarizer:
         structural_context = await self._build_structural_context(repo_url, github, tree_data=cached_tree_data)
         print(f"  Done in {time.time()-t1:.1f}s")
 
-        # ── Pass 2: Targeted similarity search ────────────────────────
+        # ── Pass 2: Agentic Exploration (Replaces old search pass) ────────
         await set_phase("search")
         t2 = time.time()
-        print("\n[Pass 2] Targeted similarity search across architecture topics...")
-        search_context = await self._build_search_context(
-            repo_url,
-            structural_context["detected_frameworks"],
-            structural_context["classification"],
-        )
-        print(f"  Done in {time.time()-t2:.1f}s")
-
-        print("\n[Pass 2b] Building full selected-chunk evidence ledger...")
-        all_chunks = await self.pipeline.get_repository_chunks(repo_url)
-        print(f"  Evidence ledger covers {len(all_chunks)} selected chunks")
+        print("\n[Pass 2] Agentic Exploration (Replaces old search pass)...")
+        from app.services.agent_explorer import AgentExplorer
+        explorer = AgentExplorer(github)
+        hints = {
+            "frameworks": list(structural_context["detected_frameworks"].keys()),
+            "classification": structural_context["classification"],
+            "ascii_tree": structural_context["ascii_tree"],
+        }
+        agent_read_files = await explorer.explore(repo_url, structural_context["branch"], hints)
+        
+        # Mock search_context and all_chunks for compatibility with Pass 3/4 until Step 6
+        search_context = {}
+        all_chunks = []
+        for path, content in agent_read_files.items():
+            chunk = {"text": content, "metadata": {"path": path, "type": "agent_read"}}
+            all_chunks.append(chunk)
+            search_context.setdefault("agent_exploration", []).append(chunk)
+            
+        print(f"  Agent read {len(agent_read_files)} files. Done in {time.time()-t2:.1f}s")
 
         # ── Pass 3: Parallel file-group summaries (with caching) ──────
         await set_phase("group_summaries")

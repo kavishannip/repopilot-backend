@@ -180,58 +180,13 @@ class ProcessingPipeline:
         
         nodes, edges = scanner.scan(repo_id, all_files, scan_contents, selected_paths)
 
-        print(f"Processing {len(selected_files)} selected files for deep embedding...")
-        all_chunks = []
-
-        contents = await github.get_files_content_batch(
-            repo_url,
-            [f["path"] for f in selected_files],
-            branch=branch,
-            max_chars_per_file=settings.max_source_file_chars,
-        )
-        for f in selected_files:
-            content = contents.get(f["path"])
-            if content:
-                try:
-                    all_chunks.extend(self.chunker.chunk_file(f["path"], content))
-                except Exception as e:
-                    logger.warning("Failed to chunk %s: %r", f["path"], e)
-
-        print(f"Total chunks generated: {len(all_chunks)}")
-
-        # Batch embedding
-        embeddings = []
-        if all_chunks:
-            texts = [c["text"] for c in all_chunks]
-            print(f"Embedding {len(texts)} chunks...")
-            embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
-
-        # Save chunks and graph
+        # Save graph
         async with async_session() as session:
             if nodes:
                 session.add_all(nodes)
                 await session.flush()
             if edges:
                 session.add_all(edges)
-
-            if all_chunks and embeddings:
-                print("Saving to database...")
-                db_chunks = []
-                for i, c in enumerate(all_chunks):
-                    clean_text = c["text"].replace("\x00", "")
-                    clean_metadata = {
-                        k: v.replace("\x00", "") if isinstance(v, str) else v
-                        for k, v in c["metadata"].items()
-                    }
-                    db_chunks.append(
-                        RepoChunk(
-                            repository_id=repo_id,
-                            chunk_text=clean_text,
-                            chunk_metadata=clean_metadata,
-                            embedding=embeddings[i]
-                        )
-                    )
-                session.add_all(db_chunks)
 
             await session.commit()
             print("Done processing repository.")
@@ -241,7 +196,7 @@ class ProcessingPipeline:
                 "status": "processed",
                 "repo_url": repo_url,
                 "commit_sha": commit_sha,
-                "chunks_count": len(all_chunks),
+                "chunks_count": 0,
                 "selected_files": selected_file_paths,
                 "tree_data": tree_data,   # passed to summarizer to skip second fetch
             }
