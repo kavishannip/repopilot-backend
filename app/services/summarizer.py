@@ -385,39 +385,22 @@ class RepoSummarizer:
         }
         agent_read_files = await explorer.explore(repo_url, structural_context["branch"], hints)
         
-        # Mock search_context and all_chunks for compatibility with Pass 3/4 until Step 6
-        search_context = {}
-        all_chunks = []
-        for path, content in agent_read_files.items():
-            chunk = {"text": content, "metadata": {"path": path, "type": "agent_read"}}
-            all_chunks.append(chunk)
-            search_context.setdefault("agent_exploration", []).append(chunk)
-            
-        print(f"  Agent read {len(agent_read_files)} files. Done in {time.time()-t2:.1f}s")
-
-        # ── Pass 3: Parallel file-group summaries (with caching) ──────
-        await set_phase("group_summaries")
-        t3 = time.time()
-        print("\n[Pass 3] Generating file-group summaries (Groq, map-reduce)...")
-        group_summaries = await self._generate_group_summaries(
-            structural_context, search_context, repo_url, commit_sha
-        )
-        print(f"  Done in {time.time()-t3:.1f}s, {len(group_summaries)} summaries")
+        # ── Pass 3 is removed (Step 6 single-pass synthesis) ────────
 
         # ── Static analysis (inject as ground truth for Pass 4) ──────
         dep_usage = _analyze_dependency_usage(
             structural_context["parsed_manifests"],
             structural_context["full_file_contents"],
-            search_context,
-            all_chunks,
+            {},
+            [],
         )
         env_vars = _analyze_env_vars(
             structural_context["full_file_contents"],
-            search_context,
-            all_chunks,
+            {},
+            [],
         )
         tech_evidence = _build_positive_tech_evidence(
-            all_chunks,
+            [],
             structural_context["full_file_contents"],
         )
         structural_context["tech_evidence"] = tech_evidence
@@ -441,8 +424,7 @@ class RepoSummarizer:
                 repo_url=repo_url,
                 commit_sha=commit_sha,
                 structural_context=structural_context,
-                search_context=search_context,
-                group_summaries=group_summaries,
+                agent_read_files=agent_read_files,
                 dep_usage=dep_usage,
                 env_vars=env_vars,
                 tech_evidence=tech_evidence,
@@ -455,7 +437,7 @@ class RepoSummarizer:
             print(f"  [Pass 4] FAILED: {e}. Serving lite brief fallback.")
             brief = self._build_lite_brief(
                 structural_context, 
-                group_summaries, 
+                agent_read_files, 
                 repo_url, 
                 commit_sha, 
                 process_stats.get("selected_files", []),
@@ -685,120 +667,7 @@ class RepoSummarizer:
         print(f"  Retrieved {total} unique relevant chunks across all queries")
         return context_by_topic
 
-    # ─────────────────────────────────────────────────────────
-    # Pass 3: Parallel file-group summaries (map-reduce) + caching
-    # ─────────────────────────────────────────────────────────
-
-    async def _generate_group_summaries(
-        self,
-        structural_context: Dict[str, Any],
-        search_context: Dict[str, List[Dict[str, Any]]],
-        repo_url: str,
-        commit_sha: str,
-    ) -> List[str]:
-        """
-        Generate focused summaries per architectural area in parallel (Groq).
-        Caches results in DB keyed by commit_sha — skips LLM on subsequent runs.
-        """
-        # Check Phase 3 cache
-        async with async_session() as session:
-            stmt = select(Repository).where(Repository.repo_url == repo_url)
-            result = await session.execute(stmt)
-            repo_obj = result.scalar_one_or_none()
-            if (repo_obj
-                    and repo_obj.group_summaries_sha == commit_sha
-                    and repo_obj.group_summaries):
-                cached = repo_obj.group_summaries
-                if isinstance(cached, list) and cached:
-                    print(f"  [Phase 3] Cache hit — skipping Groq calls ({len(cached)} summaries)")
-                    return cached
-
-        # Build groups from file contents + search results
-        full_file_contents = structural_context["full_file_contents"]
-        groups: Dict[str, List[str]] = {}
-
-        for path, content in full_file_contents.items():
-            parts = path.split("/")
-            group_key = parts[0] if len(parts) > 1 else "_root"
-            groups.setdefault(group_key, [])
-            groups[group_key].append(f"--- {path} ---\n{content[:3000]}")
-
-        for topic, chunks in search_context.items():
-            for chunk in chunks:
-                path = chunk["metadata"].get("path", "unknown")
-                parts = path.split("/")
-                group_key = f"_search_{parts[0]}" if len(parts) > 1 else "_search_root"
-                groups.setdefault(group_key, [])
-                groups[group_key].append(
-                    f"--- {path} ({chunk['metadata'].get('type', 'snippet')}) ---\n{chunk['text'][:1500]}"
-                )
-
-        sorted_groups = sorted(groups.items(), key=lambda x: len("\n".join(x[1])), reverse=True)
-        top_groups = sorted_groups[:MAX_SOURCE_GROUPS]
-
-        print(f"  Summarizing {len(top_groups)} file groups "
-              f"(Groq:{settings.groq_model}, concurrency:{settings.phase3_concurrency})...")
-        sem = asyncio.Semaphore(settings.phase3_concurrency)
-
-        async def summarize_group(group_key: str, file_texts: List[str], index: int) -> Tuple[str, Optional[int], Optional[int]]:
-            await asyncio.sleep(index * 0.3)  # stagger startup
-            context = "\n\n".join(file_texts)[:MAX_GROUP_CONTEXT_CHARS]
-
-            messages = [
-                SystemMessage(content=(
-                    "You are a senior software architect. Analyze this code from a repository. "
-                    "Produce a tight technical summary (2-3 sentences, max 150 words) covering: "
-                    "1) What this code/directory does "
-                    "2) Key exports, APIs, or interfaces exposed (name actual functions/routes) "
-                    "3) Critical dependencies or integrations. "
-                    "Be specific — name actual files and functions. Skip obvious observations."
-                )),
-                HumanMessage(content=f"Directory/Group: {group_key}\n\n{context}"),
-            ]
-
-            async with sem:
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        result = await self.fast_llm.ainvoke(messages)
-                        # Log token usage if available
-                        usage = getattr(result, "response_metadata", {}).get("token_usage", {})
-                        prompt_tok = usage.get("prompt_tokens", "?")
-                        comp_tok = usage.get("completion_tokens", "?")
-                        logger.debug(f"  [Phase 3] Group '{group_key}': {prompt_tok}p/{comp_tok}c tokens")
-                        return f"[{group_key}]\n{result.content}", prompt_tok, comp_tok
-                    except Exception as e:
-                        error_msg = str(e)
-                        if "429" in error_msg and attempt < max_retries - 1:
-                            wait_time = 3 ** (attempt + 1)  # 3s, 9s, 27s
-                            print(f"  [429 Rate Limit] Group '{group_key}' (Groq) retrying in {wait_time}s...")
-                            await asyncio.sleep(wait_time)
-                        else:
-                            print(f"  Group summary failed for '{group_key}': {e}")
-                            return f"[{group_key}] (summary failed: {e})", None, None
-                return f"[{group_key}] (summary failed: max retries)", None, None
-
-        raw_results = await asyncio.gather(
-            *(summarize_group(key, texts, idx) for idx, (key, texts) in enumerate(top_groups))
-        )
-        summaries = [r[0] for r in raw_results]
-        total_prompt = sum(r[1] for r in raw_results if r[1] is not None)
-        total_comp = sum(r[2] for r in raw_results if r[2] is not None)
-        print(f"  Generated {len(summaries)} group summaries | "
-              f"Groq tokens: ~{total_prompt}p / ~{total_comp}c")
-
-        # Persist to DB cache
-        async with async_session() as session:
-            stmt = select(Repository).where(Repository.repo_url == repo_url)
-            result = await session.execute(stmt)
-            repo_obj = result.scalar_one_or_none()
-            if repo_obj:
-                repo_obj.group_summaries = summaries
-                repo_obj.group_summaries_sha = commit_sha
-                await session.commit()
-                print(f"  [Phase 3] Cached group summaries for commit {commit_sha[:8]}")
-
-        return summaries
+    # (Pass 3 Group Summaries removed)
 
     async def _query_graph_data(self, repo_url: str, entry_points: List[str]) -> Dict[str, str]:
         """Pass 3.5: Query structural graph for data flow, unused files, and architecture verdict."""
@@ -919,8 +788,7 @@ class RepoSummarizer:
         repo_url: str,
         commit_sha: str,
         structural_context: Dict[str, Any],
-        search_context: Dict[str, List[Dict[str, Any]]],
-        group_summaries: List[str],
+        agent_read_files: Dict[str, str],
         dep_usage: Dict[str, Dict[str, Any]],
         env_vars: Dict[str, List[str]],
         tech_evidence: Dict[str, List[str]],
@@ -947,8 +815,16 @@ class RepoSummarizer:
             structural_context["classification"],
             full_file_contents,
         )
-        search_text = self._format_search_context(search_context)
-        summaries_text = "\n\n".join(group_summaries)
+        
+        # Format agent read files with truncation
+        agent_lines = []
+        for path, content in agent_read_files.items():
+            lines = content.splitlines()
+            if len(lines) > 5000:
+                content = "\n".join(lines[:5000]) + "\n... (truncated at 5000 lines)"
+            agent_lines.append(f"=== AGENT READ FILE: {path} ===\n{content}")
+        agent_files_text = "\n\n".join(agent_lines)
+        
         frameworks_text = "\n".join(f"  - {fw}: {ver}" for fw, ver in detected_frameworks.items())
         components_text = "\n".join(
             f"  - /{c['name']}: {c['estimated_role']} [{c['primary_language']}]"
@@ -1062,11 +938,8 @@ GitHub metadata:
 === FULL CRITICAL FILES (README, configs, entry points) ===
 {critical_files_text[:SYNTHESIS_CRITICAL_FILES_CHARS]}
 
-=== PER-COMPONENT SUMMARIES ===
-{summaries_text[:SYNTHESIS_SUMMARIES_CHARS]}
-
-=== TARGETED CODE SEARCH RESULTS (with real file:line references) ===
-{search_text[:SYNTHESIS_SEARCH_CHARS]}
+=== AGENT READ FILES (full file contents) ===
+{agent_files_text[:150000]}
 
 Now produce the complete RepoBrief with all evidenced fields populated accurately. Prefer "Not evidenced in the analyzed files" over unsupported guesses."""
 
@@ -1257,7 +1130,7 @@ Now produce the complete RepoBrief with all evidenced fields populated accuratel
     def _build_lite_brief(
         self,
         structural_context: Dict[str, Any],
-        group_summaries: List[str],
+        agent_read_files: Dict[str, str],
         repo_url: str,
         commit_sha: str,
         selected_files: List[str] = None,
@@ -1265,7 +1138,7 @@ Now produce the complete RepoBrief with all evidenced fields populated accuratel
         error: str = "",
     ) -> RepoBrief:
         """
-        Degraded brief assembled from Phase 1 + Phase 3 without any LLM.
+        Degraded brief assembled from Phase 1 + Phase 4 (agent files) without final synthesis.
         Flagged so consumers know depth is reduced.
         """
         meta = structural_context["meta"]
@@ -1290,11 +1163,17 @@ Now produce the complete RepoBrief with all evidenced fields populated accuratel
             for fw, ver in detected_frameworks.items()
         ]
 
-        summaries_combined = "\n\n".join(group_summaries) if group_summaries else "No summaries available."
+        agent_lines = []
+        for path, content in agent_read_files.items():
+            lines = content.splitlines()
+            if len(lines) > 500:
+                content = "\n".join(lines[:500]) + "\n... (truncated)"
+            agent_lines.append(f"[{path}]\n{content}")
+        agent_text_combined = "\n\n".join(agent_lines) if agent_lines else "No agent read files available."
 
         warning = (
             "⚠️ LITE BRIEF: Phase 4 LLM synthesis was unavailable. "
-            "This brief is assembled from static analysis only (Phase 1 + Phase 3). "
+            "This brief is assembled from static analysis only (Phase 1 + Phase 4). "
             "Architecture details and data flow descriptions may lack depth."
         )
         if error:
@@ -1302,7 +1181,7 @@ Now produce the complete RepoBrief with all evidenced fields populated accuratel
 
         return RepoBrief(
             tech_stack=tech_stack,
-            architecture_summary=f"[Lite brief] {meta.get('description', '')} | Component summaries:\n{summaries_combined[:3000]}",
+            architecture_summary=f"[Lite brief] {meta.get('description', '')} | Agent read files:\n{agent_text_combined[:3000]}",
             entry_points=[],
             flagged_issues=[warning],
             summary=f"{meta.get('description', 'No description.')} (Lite brief — reduced detail)",
