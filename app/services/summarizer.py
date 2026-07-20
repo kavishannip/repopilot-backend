@@ -368,7 +368,8 @@ class RepoSummarizer:
         await set_phase("structural_map")
         t1 = time.time()
         print("\n[Pass 1] Building structural map and reading key files...")
-        structural_context = await self._build_structural_context(repo_url, tree_data=cached_tree_data)
+        github = await self.pipeline.get_github_client(repo_url)
+        structural_context = await self._build_structural_context(repo_url, github, tree_data=cached_tree_data)
         print(f"  Done in {time.time()-t1:.1f}s")
 
         # ── Pass 2: Targeted similarity search ────────────────────────
@@ -478,19 +479,20 @@ class RepoSummarizer:
     async def _build_structural_context(
         self,
         repo_url: str,
+        github: GitHubClient,
         tree_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Fetch file tree, classify files, read critical/entry/config files in full. No LLM.
         Accepts optional pre-fetched tree_data from ProcessingPipeline to avoid duplicate API call.
         """
-        enriched_data = await self.github.get_repo_enriched_metadata(repo_url)
+        enriched_data = await github.get_repo_enriched_metadata(repo_url)
         meta = enriched_data["meta"]
         branch = meta["default_branch"]
 
         # Reuse tree_data if provided (already fetched by ProcessingPipeline)
         if tree_data is None:
             print("  [Pass 1] Fetching file tree (not cached from pipeline)...")
-            tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+            tree_data = await github.get_file_tree_structure(repo_url, branch)
         else:
             print("  [Pass 1] Reusing file tree from pipeline (no duplicate fetch).")
 
@@ -517,7 +519,7 @@ class RepoSummarizer:
         )
 
         print(f"  Reading {len(files_to_read)} key files in full...")
-        full_file_contents = await self.github.get_files_content_batch(
+        full_file_contents = await github.get_files_content_batch(
             repo_url,
             files_to_read,
             branch=branch,
