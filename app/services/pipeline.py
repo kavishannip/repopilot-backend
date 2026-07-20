@@ -246,6 +246,65 @@ class ProcessingPipeline:
 
             return results
 
+    async def embed_agent_files(self, repo_url: str, commit_sha: str, agent_read_files: Dict[str, str]) -> None:
+        """
+        Step 8: Lazy chat-only embedding. 
+        Takes the files the agent read in Step 4, chunks them, and saves to DB.
+        If chunks already exist for this commit, skips embedding.
+        """
+        async with async_session() as session:
+            stmt = select(Repository).where(Repository.repo_url == repo_url)
+            repo = (await session.execute(stmt)).scalar_one_or_none()
+            if not repo or repo.commit_sha != commit_sha:
+                print("Repo not found or commit mismatch. Cannot embed chat files.")
+                return
+
+            chunk_count = await session.scalar(
+                select(func.count()).select_from(RepoChunk).where(RepoChunk.repository_id == repo.id)
+            )
+            if chunk_count and chunk_count > 0:
+                print(f"Skipping embedding for {repo_url} - chunks already exist for this commit.")
+                return
+
+        print(f"Embedding {len(agent_read_files)} agent-read files for chat...")
+        all_chunks = []
+        for path, content in agent_read_files.items():
+            if content:
+                try:
+                    all_chunks.extend(self.chunker.chunk_file(path, content))
+                except Exception as e:
+                    logger.warning("Failed to chunk %s: %r", path, e)
+
+        if not all_chunks:
+            return
+
+        texts = [c["text"] for c in all_chunks]
+        embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
+
+        async with async_session() as session:
+            stmt = select(Repository).where(Repository.repo_url == repo_url)
+            repo = (await session.execute(stmt)).scalar_one_or_none()
+            if not repo: return
+
+            db_chunks = []
+            for i, c in enumerate(all_chunks):
+                clean_text = c["text"].replace("\x00", "")
+                clean_metadata = {
+                    k: v.replace("\x00", "") if isinstance(v, str) else v
+                    for k, v in c["metadata"].items()
+                }
+                db_chunks.append(
+                    RepoChunk(
+                        repository_id=repo.id,
+                        chunk_text=clean_text,
+                        chunk_metadata=clean_metadata,
+                        embedding=embeddings[i]
+                    )
+                )
+            session.add_all(db_chunks)
+            await session.commit()
+            print(f"Saved {len(db_chunks)} lazy-embedded chunks to DB.")
+
     async def search_chunks_by_queries(
         self,
         queries: List[str],

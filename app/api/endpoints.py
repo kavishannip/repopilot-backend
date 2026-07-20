@@ -38,7 +38,7 @@ class JobSubmitResponse(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str           # pending|running|completed|failed
-    phase: str            # queued|embedding|structural_map|search|group_summaries|synthesis|done|failed
+    phase: str            # queued|structural_map|agent_exploration|graph_query|synthesis|done|failed
     result: Optional[RepoBrief] = None
     error: Optional[str] = None
     created_at: Optional[str] = None

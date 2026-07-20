@@ -353,10 +353,10 @@ class RepoSummarizer:
         print(f"Starting multi-pass analysis for: {repo_url}")
         print(f"{'='*60}")
 
-        # ── Pass 0: Ensure repo is embedded ──────────────────────────
-        await set_phase("embedding")
+        # ── Pass 0: Ensure repo is pre-processed ──────────────────────────
+        await set_phase("queued")
         t0 = time.time()
-        print("\n[Pass 0] Embedding repository chunks...")
+        print("\n[Pass 0] Pre-processing repository metadata...")
         process_stats = await self.pipeline.process_repo(repo_url)
         commit_sha = process_stats["commit_sha"]
         # tree_data from process_repo (avoids a second get_file_tree_structure() call)
@@ -373,7 +373,7 @@ class RepoSummarizer:
         print(f"  Done in {time.time()-t1:.1f}s")
 
         # ── Pass 2: Agentic Exploration (Replaces old search pass) ────────
-        await set_phase("search")
+        await set_phase("agent_exploration")
         t2 = time.time()
         print("\n[Pass 2] Agentic Exploration (Replaces old search pass)...")
         from app.services.agent_explorer import AgentExplorer

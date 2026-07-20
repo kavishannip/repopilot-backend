@@ -21,8 +21,6 @@ class Repository(Base):
     stars = Column(Integer)
     description = Column(Text)
     brief = Column(JSONB)                  # Cached Phase 4 RepoBrief
-    group_summaries = Column(JSONB)         # Cached Phase 3 group summaries
-    group_summaries_sha = Column(String)    # Commit SHA that produced group_summaries
     last_accessed_at = Column(DateTime, default=datetime.utcnow) # For LRU cache eviction
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
