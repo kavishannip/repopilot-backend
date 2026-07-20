@@ -4,11 +4,13 @@ from sqlalchemy import delete
 from typing import List, Dict, Any, Optional
 
 from app.database import async_session
-from app.models.schema import Repository, RepoChunk
+from app.models.schema import Repository, RepoChunk, GraphNode, GraphEdge
 from app.services.github_client import GitHubClient, RepoSizeExceededError, RepoTooComplexError
 from app.services.chunker import CodeChunker
 from app.services.embedding import NVIDIAEmbeddingClient
 from app.config import settings
+from datetime import datetime
+from sqlalchemy import func
 
 import logging
 logger = logging.getLogger(__name__)
@@ -37,12 +39,26 @@ class ProcessingPipeline:
         commit_sha = await self._get_branch_commit(repo_url, branch)
 
         async with async_session() as session:
+            # --- LRU Cache Eviction ---
+            count_stmt = select(func.count(Repository.id))
+            repo_count = await session.scalar(count_stmt)
+            if repo_count and repo_count > 25:
+                logger.info("Repo count > 25, evicting oldest repository to stay under 500MB budget.")
+                oldest_stmt = select(Repository).order_by(Repository.last_accessed_at.asc()).limit(1)
+                oldest_repo = (await session.execute(oldest_stmt)).scalar_one_or_none()
+                if oldest_repo:
+                    await session.delete(oldest_repo)
+                    await session.commit()
+
             stmt = select(Repository).where(Repository.repo_url == repo_url)
             result = await session.execute(stmt)
             repo_obj = result.scalar_one_or_none()
 
             if repo_obj and repo_obj.commit_sha == commit_sha:
                 print("Cache hit! Repository is up to date.")
+                repo_obj.last_accessed_at = datetime.utcnow()
+                await session.commit()
+
                 stmt_count = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
                 res = await session.execute(stmt_count)
                 chunks = res.scalars().all()
@@ -71,7 +87,8 @@ class ProcessingPipeline:
                     commit_sha=commit_sha,
                     language=meta["language"],
                     stars=meta["stars"],
-                    description=meta["description"]
+                    description=meta["description"],
+                    last_accessed_at=datetime.utcnow()
                 )
                 session.add(repo_obj)
             else:
@@ -79,9 +96,12 @@ class ProcessingPipeline:
                 repo_obj.language = meta["language"]
                 repo_obj.stars = meta["stars"]
                 repo_obj.description = meta["description"]
+                repo_obj.last_accessed_at = datetime.utcnow()
 
-                # Delete stale chunks
+                # Delete stale chunks and graph
                 await session.execute(delete(RepoChunk).where(RepoChunk.repository_id == repo_obj.id))
+                await session.execute(delete(GraphNode).where(GraphNode.repository_id == repo_obj.id))
+                await session.execute(delete(GraphEdge).where(GraphEdge.repository_id == repo_obj.id))
 
             await session.commit()
             repo_id = repo_obj.id
@@ -101,31 +121,55 @@ class ProcessingPipeline:
         # Raw file list from the already-fetched tree (pre-prioritized, pre-noise-filtered).
         # This avoids a duplicate GitHub tree request and lets smart selection see the
         # complete analyzable repo instead of a pre-truncated slice.
-        files = tree_data.get("files")
-        if files is None:
+        all_files = tree_data.get("files")
+        if all_files is None:
             print("Fetching file list...")
-            files = await self.github.list_files(repo_url, branch=branch)
+            all_files = await self.github.list_files(repo_url, branch=branch)
 
         # Smart file selection — may raise RepoTooComplexError
         from app.services.file_selector import SmartFileSelector
         selector = SmartFileSelector()
-        files = await selector.select_files(
-            all_files=files,
+        selected_files = await selector.select_files(
+            all_files=all_files,
             classification=classification,
             ascii_tree=ascii_tree,
             file_sizes=file_sizes,
         )
 
-        print(f"Processing {len(files)} selected files...")
+        selected_paths = {f["path"] for f in selected_files}
+
+        # --- Structural Scan ---
+        print("Running full-repo structural scan...")
+        from app.services.structural_scanner import StructuralScanner
+        scanner = StructuralScanner()
+        scan_files = [
+            f for f in all_files 
+            if f.get("type", "file") in ("file", "blob") and f["path"].endswith((
+                ".py", ".ts", ".tsx", ".js", ".jsx", 
+                ".go", ".java", ".kt", ".rs", ".c", ".cpp", ".h", ".hpp", 
+                ".cs", ".rb", ".php", ".swift", ".m"
+            ))
+        ]
+        
+        scan_contents = await self.github.get_files_content_batch(
+            repo_url,
+            [f["path"] for f in scan_files[:3000]],
+            branch=branch,
+            max_chars_per_file=50_000, # Lightweight fetch for imports
+        )
+        
+        nodes, edges = scanner.scan(repo_id, all_files, scan_contents, selected_paths)
+
+        print(f"Processing {len(selected_files)} selected files for deep embedding...")
         all_chunks = []
 
         contents = await self.github.get_files_content_batch(
             repo_url,
-            [f["path"] for f in files],
+            [f["path"] for f in selected_files],
             branch=branch,
             max_chars_per_file=settings.max_source_file_chars,
         )
-        for f in files:
+        for f in selected_files:
             content = contents.get(f["path"])
             if content:
                 try:
@@ -142,8 +186,14 @@ class ProcessingPipeline:
             print(f"Embedding {len(texts)} chunks...")
             embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
 
-        # Save chunks
+        # Save chunks and graph
         async with async_session() as session:
+            if nodes:
+                session.add_all(nodes)
+                await session.flush()
+            if edges:
+                session.add_all(edges)
+
             if all_chunks and embeddings:
                 print("Saving to database...")
                 db_chunks = []
@@ -166,7 +216,7 @@ class ProcessingPipeline:
             await session.commit()
             print("Done processing repository.")
 
-            selected_file_paths = [f["path"] for f in files]
+            selected_file_paths = [f["path"] for f in selected_files]
             return {
                 "status": "processed",
                 "repo_url": repo_url,
@@ -188,9 +238,6 @@ class ProcessingPipeline:
             return resp.json()["sha"]
 
     async def search_chunks(self, query: str, repo_url: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Embed a search query and find most similar chunks for a specific repo.
-        """
         query_embedding = await self.embedder.embed_chunks([query], input_type="query")
         if not query_embedding:
             return []

@@ -139,11 +139,10 @@ class SmartFileSelector:
         )
 
         if len(must_keep_paths) > MAX_FILE_COUNT:
-            raise RepoTooComplexError(
-                f"This repository has {len(must_keep_paths)} critical/entry-point/config files "
-                f"alone, exceeding the {MAX_FILE_COUNT}-file accuracy budget. "
-                "RepoPilot cannot analyze this repository without compromising accuracy. "
-                "Try a focused sub-directory or a smaller repository."
+            logger.warning(
+                f"This repository has {len(must_keep_paths)} critical/entry-point/config files, "
+                f"which exceeds the {MAX_FILE_COUNT}-file chunking budget. "
+                f"Proceeding anyway to maintain accuracy, but this may cause large embedding costs."
             )
 
         # ── Step 1: If smart selection disabled, return up to MAX_FILE_COUNT ──
@@ -194,12 +193,10 @@ class SmartFileSelector:
         final_paths = must_keep_paths | selected_opt
         total = len(final_paths)
 
-        # ── Step 5: Final accuracy gate ───────────────────────────────────
         if total > MAX_FILE_COUNT:
-            raise RepoTooComplexError(
-                f"Analysis requires {total} files but the accuracy budget is {MAX_FILE_COUNT}. "
-                "RepoPilot cannot analyze this repository without compromising accuracy. "
-                "Try a focused sub-directory or a smaller repository."
+            logger.warning(
+                f"Analysis requires {total} files but the chunking budget is {MAX_FILE_COUNT}. "
+                "Proceeding with all required files to ensure accuracy."
             )
 
         logger.info(
@@ -258,9 +255,9 @@ class SmartFileSelector:
             "  - Pure styling (CSS/SCSS) unless it's a global design system\n"
             "  - Generated or boilerplate code\n"
             "  - Test files (unless they demonstrate critical patterns not visible elsewhere)\n\n"
-            f"ACCURACY RULE: If you need more than {budget_remaining} files to accurately "
-            "understand this codebase, return ALL their indices. "
-            "Do not artificially cap your selection — accuracy is the priority."
+            "ACCURACY RULE: Select ONLY the files that actually matter to understand the project architecture and logic. "
+            "Return the indices of all such files. Do not artificially cap your selection — accuracy is the priority. "
+            "However, do not select files that are redundant or unnecessary for a high-level understanding."
         )
 
         user_prompt = (

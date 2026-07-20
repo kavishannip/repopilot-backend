@@ -412,12 +412,16 @@ class RepoSummarizer:
             structural_context["full_file_contents"],
         )
         structural_context["tech_evidence"] = tech_evidence
-        logger.info(
-            "Static analysis: %s deps classified, %s env vars found, %s tech evidence groups",
-            len(dep_usage),
-            len(env_vars),
-            len(tech_evidence),
+        
+        # ── Pass 3.5: Graph Query ─────────────────────────────────────
+        await set_phase("graph_query")
+        t35 = time.time()
+        print("\n[Pass 3.5] Querying structural graph data...")
+        graph_data = await self._query_graph_data(
+            repo_url, 
+            structural_context["classification"]["entry_points"]
         )
+        print(f"  Done in {time.time()-t35:.1f}s")
 
         # ── Pass 4: Final synthesis → structured RepoBrief ────────────
         await set_phase("synthesis")
@@ -433,6 +437,7 @@ class RepoSummarizer:
                 dep_usage=dep_usage,
                 env_vars=env_vars,
                 tech_evidence=tech_evidence,
+                graph_data=graph_data,
                 selected_files=process_stats.get("selected_files", []),
                 project_types=structural_context.get("project_types", []),
             )
@@ -785,6 +790,116 @@ class RepoSummarizer:
 
         return summaries
 
+    async def _query_graph_data(self, repo_url: str, entry_points: List[str]) -> Dict[str, str]:
+        """Pass 3.5: Query structural graph for data flow, unused files, and architecture verdict."""
+        from app.models.schema import GraphNode, GraphEdge, Repository
+        from collections import defaultdict
+        
+        async with async_session() as session:
+            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
+            repo = (await session.execute(stmt_repo)).scalar_one_or_none()
+            if not repo:
+                return {"data_flow": "", "unused_deps": "", "arch_verdict": ""}
+                
+            nodes_res = await session.execute(select(GraphNode).where(GraphNode.repository_id == repo.id))
+            edges_res = await session.execute(select(GraphEdge).where(GraphEdge.repository_id == repo.id))
+            
+            nodes = nodes_res.scalars().all()
+            edges = edges_res.scalars().all()
+            
+        if not nodes:
+            return {"data_flow": "No graph data available.", "unused_deps": "No graph data available.", "arch_verdict": "No graph data available."}
+            
+        node_by_id = {n.id: n for n in nodes}
+        node_by_path = {n.path: n for n in nodes}
+        
+        # Build adjacency lists for 'imports'
+        adj_imports = defaultdict(list)
+        in_degree = defaultdict(int)
+        
+        # Build undirected adjacency for connected components
+        adj_undirected = defaultdict(list)
+        
+        for e in edges:
+            if e.type == "imports":
+                adj_imports[e.source_node_id].append(e.target_node_id)
+                in_degree[e.target_node_id] += 1
+                adj_undirected[e.source_node_id].append(e.target_node_id)
+                adj_undirected[e.target_node_id].append(e.source_node_id)
+                
+        # 1. TRACED DATA FLOW
+        data_flow_lines = []
+        for ep in entry_points:
+            ep_node = node_by_path.get(ep)
+            if ep_node:
+                visited = {ep_node.id}
+                queue = [(ep_node.id, [ep_node.path])]
+                traces = []
+                while queue and len(traces) < 10:
+                    curr_id, path_chain = queue.pop(0)
+                    if len(path_chain) >= 4:
+                        traces.append(" -> ".join(path_chain))
+                        continue
+                        
+                    children = adj_imports.get(curr_id, [])
+                    if not children:
+                        traces.append(" -> ".join(path_chain))
+                    else:
+                        for child_id in children[:3]:
+                            if child_id not in visited:
+                                visited.add(child_id)
+                                child_path = node_by_id[child_id].path
+                                queue.append((child_id, path_chain + [child_path]))
+                if traces:
+                    data_flow_lines.append(f"Entry: {ep}\n  " + "\n  ".join(traces))
+                    
+        data_flow_text = "\n\n".join(data_flow_lines) if data_flow_lines else "No import traces found from entry points."
+        
+        # 2. DEPENDENCY USAGE (Unused local files)
+        unused_files = []
+        entry_paths_set = set(entry_points)
+        for n in nodes:
+            if n.type == "file" and n.path not in entry_paths_set:
+                if in_degree[n.id] == 0:
+                    unused_files.append(n.path)
+                    
+        if unused_files:
+            unused_deps_text = "The following local files have NO incoming import edges (they might be unused or dynamically imported):\n"
+            unused_deps_text += ", ".join(sorted(unused_files)[:50])
+            if len(unused_files) > 50:
+                unused_deps_text += f" (+{len(unused_files)-50} more)"
+        else:
+            unused_deps_text = "All local files have incoming import edges."
+            
+        # 3. ARCHITECTURE VERDICT (Connected Components)
+        visited_cc = set()
+        components_count = 0
+        file_nodes = [n for n in nodes if n.type == "file"]
+        
+        for n in file_nodes:
+            if n.id not in visited_cc:
+                components_count += 1
+                q = [n.id]
+                visited_cc.add(n.id)
+                while q:
+                    curr = q.pop(0)
+                    for neighbor in adj_undirected.get(curr, []):
+                        if neighbor not in visited_cc:
+                            visited_cc.add(neighbor)
+                            q.append(neighbor)
+                            
+        arch_verdict = f"The import graph contains {components_count} isolated connected component(s). "
+        if components_count == 1:
+            arch_verdict += "This strongly implies a monolithic or single tightly-coupled architecture."
+        else:
+            arch_verdict += "This implies multiple disconnected modules or microservices."
+            
+        return {
+            "data_flow": data_flow_text,
+            "unused_deps": unused_deps_text,
+            "arch_verdict": arch_verdict
+        }
+
     # ─────────────────────────────────────────────────────────
     # Pass 4: Final synthesis → RepoBrief
     # ─────────────────────────────────────────────────────────
@@ -799,6 +914,7 @@ class RepoSummarizer:
         dep_usage: Dict[str, Dict[str, Any]],
         env_vars: Dict[str, List[str]],
         tech_evidence: Dict[str, List[str]],
+        graph_data: Dict[str, str],
         selected_files: List[str] = None,
         project_types: List[str] = None,
     ) -> RepoBrief:
@@ -855,11 +971,11 @@ Your task: produce a HIGHLY ACCURATE RepoBrief that could let someone draw an ar
 
 STRICT RULES:
 - API endpoints: report HTTP methods ONLY from actual route handler code (@app.get, router.post, app.use). NEVER infer from folder names.
-- Architecture type: label as 'microservices' ONLY if multiple separately deployable services with distinct entry points/Dockerfiles/ports. Multiple modules = 'modular monolith'.
+- Architecture type: Treat the ARCHITECTURE VERDICT as verified ground truth. Do not label as 'microservices' if the verdict says there is only 1 connected component.
 - File citations: for every claim in architecture_summary and data_flow, cite at least one real file path using the references provided. Use format [filename.ext:Lstart-Lend]. Do NOT invent line numbers — use only what's in the context.
 - Code vs docs: flag a README/comment contradiction ONLY when there is positive code evidence that directly contradicts it. Missing evidence, sparse retrieval, or "not observed in selected code" is not a contradiction.
-- Data flow: trace through ACTUAL function names and imports you see. Example: "Request hits router.post('/analyze') in endpoints.py → calls summarizer.generate_brief() → ..."
-- Dependencies: use the STATIC ANALYSIS section for observed usage. "NOT OBSERVED in selected analyzed code" is uncertainty, not an issue. Never put a dependency into flagged_issues merely because it was not observed.
+- Data flow: Treat the TRACED DATA FLOW as verified ground truth. Trace data flow using the exact chain provided. Do not narrate from memory.
+- Dependencies: Treat the DEPENDENCY USAGE and STATIC ANALYSIS sections as verified ground truth. "NOT OBSERVED in selected analyzed code" is uncertainty, not an issue. Never put a dependency into flagged_issues merely because it was not observed.
 - Env vars: use the STATIC ANALYSIS section. Only report vars the CODE actually reads.
 - ALL fields REQUIRED with substantive content when evidence exists. Empty lists are acceptable only when the context has no supporting evidence.
 - EVIDENCE FIRST: Do not infer specific technologies, endpoints, databases, services, deployment topology, auth, or data stores from framework conventions alone. If a detail is not present in metadata, manifests, file contents, summaries, or search results, write "Not evidenced in the analyzed files" instead of inventing it.
@@ -923,6 +1039,15 @@ GitHub metadata:
 
 === STATIC ANALYSIS: ENVIRONMENT VARIABLES (read from code, not docs) ===
 {env_vars_text}
+
+=== TRACED DATA FLOW (from graph) ===
+{graph_data.get('data_flow', '')}
+
+=== DEPENDENCY USAGE (from graph) ===
+{graph_data.get('unused_deps', '')}
+
+=== ARCHITECTURE VERDICT (from graph) ===
+{graph_data.get('arch_verdict', '')}
 
 === FULL CRITICAL FILES (README, configs, entry points) ===
 {critical_files_text[:SYNTHESIS_CRITICAL_FILES_CHARS]}

@@ -1,10 +1,10 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy import Index
 import uuid
-from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy import HALFVEC
 
 Base = declarative_base()
 
@@ -23,10 +23,13 @@ class Repository(Base):
     brief = Column(JSONB)                  # Cached Phase 4 RepoBrief
     group_summaries = Column(JSONB)         # Cached Phase 3 group summaries
     group_summaries_sha = Column(String)    # Commit SHA that produced group_summaries
+    last_accessed_at = Column(DateTime, default=datetime.utcnow) # For LRU cache eviction
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     chunks = relationship("RepoChunk", back_populates="repository", cascade="all, delete-orphan")
+    nodes = relationship("GraphNode", back_populates="repository", cascade="all, delete-orphan")
+    edges = relationship("GraphEdge", back_populates="repository", cascade="all, delete-orphan")
 
 class RepoChunk(Base):
     __tablename__ = "repo_chunks"
@@ -34,11 +37,32 @@ class RepoChunk(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     chunk_text = Column(Text, nullable=False)
-    embedding = Column(Vector(2048)) # Nvidia nemotron-3-embed-1b 
+    embedding = Column(HALFVEC(2048)) # Nvidia nemotron-3-embed-1b (storage optimized)
     chunk_metadata = Column(JSONB)
 
     repository = relationship("Repository", back_populates="chunks")
 
+class GraphNode(Base):
+    __tablename__ = "graph_nodes"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
+    path = Column(String, nullable=False, index=True)
+    type = Column(String, nullable=False) # 'folder' or 'file'
+    deep_analysis = Column(Boolean, default=False)
+
+    repository = relationship("Repository", back_populates="nodes")
+
+class GraphEdge(Base):
+    __tablename__ = "graph_edges"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_node_id = Column(UUID(as_uuid=True), ForeignKey("graph_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    type = Column(String, nullable=False) # 'contains' or 'imports'
+
+    repository = relationship("Repository", back_populates="edges")
 
 class AnalysisJob(Base):
     """
@@ -58,4 +82,4 @@ class AnalysisJob(Base):
 
 
 # Indexes for common lookups (created separately from table def for clarity)
-__all__ = ["Base", "Repository", "RepoChunk", "AnalysisJob"]
+__all__ = ["Base", "Repository", "RepoChunk", "GraphNode", "GraphEdge", "AnalysisJob"]
