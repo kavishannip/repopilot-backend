@@ -2,9 +2,8 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.prebuilt import create_react_agent
 from langchain_groq import ChatGroq
 from app.config import settings
 from app.services.github_client import GitHubClient
@@ -110,8 +109,7 @@ class AgentExplorer:
     def __init__(self, github: GitHubClient):
         self.github = github
         # We need a 70B model or equivalent for agent loops.
-        # Assuming GROQ_MODEL might be 8B, we'll try to use llama3-70b-8192 if possible, or fallback to default
-        model_name = "llama3-70b-8192" 
+        model_name = settings.groq_model or "llama-3.3-70b-versatile"
         self.llm = ChatGroq(
             api_key=settings.groq_api_key,
             model=model_name,
@@ -151,30 +149,22 @@ INSTRUCTIONS:
 4. Once you have read enough files to understand the core architecture (or if you run out of things to check), use the Final Answer to summarize briefly what you found. The actual files you read are automatically collected in the background.
 """
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-
-        agent = create_tool_calling_agent(self.llm, tools, prompt)
+        agent = create_react_agent(self.llm, tools, prompt=system_prompt)
         
-        # Max steps = 20, max_execution_time = 120s (2 mins)
-        agent_executor = AgentExecutor(
-            agent=agent, 
-            tools=tools, 
-            verbose=True, 
-            max_iterations=20, 
-            max_execution_time=120,
-            return_intermediate_steps=False
-        )
-
         try:
             logger.info(f"Starting agent exploration for {repo_url}...")
-            # We run it in async mode
-            await agent_executor.ainvoke({"input": "Begin exploration."})
+            # We run it in async mode with a 2-minute timeout and 20 max steps (recursion_limit)
+            await asyncio.wait_for(
+                agent.ainvoke(
+                    {"messages": [HumanMessage(content="Begin exploration.")]},
+                    {"recursion_limit": 20}
+                ),
+                timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Agent exploration timed out after 2 minutes for {repo_url}")
         except Exception as e:
-            logger.error(f"Agent exploration failed or timed out: {e}")
+            logger.error(f"Agent exploration failed: {e}")
             
         logger.info(f"Agent finished. Read {len(toolkit.read_files)} files.")
         return toolkit.read_files

@@ -32,6 +32,15 @@ async def github_app_callback(req: InstallCallbackRequest):
         if not token:
             raise HTTPException(status_code=400, detail="Invalid installation ID")
             
+        # Fetch the installation details to get the account name
+        details = await github_auth.get_installation_details(req.installation_id)
+        account_name = details.get("account", {}).get("login")
+        target_type = details.get("account", {}).get("type", "User")
+        repository_selection = details.get("repository_selection", "all")
+
+        if not account_name:
+            raise HTTPException(status_code=400, detail="Could not determine account name for installation")
+            
         async with async_session() as session:
             # Check if it already exists
             stmt = select(GithubInstallation).where(GithubInstallation.installation_id == req.installation_id)
@@ -39,13 +48,18 @@ async def github_app_callback(req: InstallCallbackRequest):
             existing = result.scalar_one_or_none()
             
             if existing:
-                return {"message": "Installation already registered"}
+                # Update existing record in case account name changed or repository selection changed
+                existing.account_name = account_name
+                existing.target_type = target_type
+                existing.repository_selection = repository_selection
+                await session.commit()
+                return {"message": "Installation already registered, updated details"}
                 
             new_install = GithubInstallation(
                 installation_id=req.installation_id,
-                account_name="fetched_later", # Can fetch via GitHub API with token
-                target_type="User",
-                repository_selection="all"
+                account_name=account_name,
+                target_type=target_type,
+                repository_selection=repository_selection
             )
             session.add(new_install)
             await session.commit()

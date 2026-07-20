@@ -48,4 +48,21 @@ class GitHubAppAuth:
             data = resp.json()
             return data["token"]
 
+    async def get_installation_details(self, installation_id: str) -> dict:
+        """Fetch installation details to get account login."""
+        encoded_jwt = self.generate_jwt()
+        
+        headers = {
+            "Authorization": f"Bearer {encoded_jwt}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://api.github.com/app/installations/{installation_id}",
+                headers=headers
+            )
+            resp.raise_for_status()
+            return resp.json()
+
 github_auth = GitHubAppAuth()
