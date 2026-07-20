@@ -3,7 +3,7 @@ from pydantic import BaseModel
 import re
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from app.database import async_session
 from sqlalchemy.future import select
@@ -43,6 +43,23 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class GraphNodeResponse(BaseModel):
+    id: str
+    path: str
+    type: str
+    deep_analysis: bool
+
+class GraphEdgeResponse(BaseModel):
+    id: str
+    source_node_id: str
+    target_node_id: str
+    type: str
+
+class GraphDataResponse(BaseModel):
+    nodes: List[GraphNodeResponse]
+    edges: List[GraphEdgeResponse]
 
 
 def is_valid_github_url(url: str) -> bool:
@@ -161,3 +178,50 @@ async def get_job_status(job_id: str):
         created_at=job.get("created_at"),
         updated_at=job.get("updated_at"),
     )
+
+
+@router.get("/graph", response_model=GraphDataResponse)
+async def get_graph_data(repo_url: str):
+    """
+    Fetch raw graph data (nodes and edges) for frontend visualization.
+    """
+    repo_url = repo_url.rstrip("/")
+    if not is_valid_github_url(repo_url):
+        raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
+
+    async with async_session() as session:
+        # Get repository
+        stmt = select(Repository).where(Repository.repo_url == repo_url)
+        repo_obj = (await session.execute(stmt)).scalar_one_or_none()
+        if not repo_obj:
+            raise HTTPException(status_code=404, detail="Repository not found or hasn't been analyzed yet.")
+            
+        from app.models.schema import GraphNode, GraphEdge
+        
+        # Get nodes
+        nodes_stmt = select(GraphNode).where(GraphNode.repository_id == repo_obj.id)
+        nodes = (await session.execute(nodes_stmt)).scalars().all()
+        
+        # Get edges
+        edges_stmt = select(GraphEdge).where(GraphEdge.repository_id == repo_obj.id)
+        edges = (await session.execute(edges_stmt)).scalars().all()
+        
+    return GraphDataResponse(
+        nodes=[
+            GraphNodeResponse(
+                id=str(n.id), 
+                path=n.path, 
+                type=n.type, 
+                deep_analysis=n.deep_analysis
+            ) for n in nodes
+        ],
+        edges=[
+            GraphEdgeResponse(
+                id=str(e.id), 
+                source_node_id=str(e.source_node_id), 
+                target_node_id=str(e.target_node_id), 
+                type=e.type
+            ) for e in edges
+        ]
+    )
+
