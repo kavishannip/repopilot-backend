@@ -64,6 +64,18 @@ class GraphEdge(Base):
 
     repository = relationship("Repository", back_populates="edges")
 
+class GithubInstallation(Base):
+    __tablename__ = "github_installations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    installation_id = Column(String, unique=True, index=True, nullable=False)
+    account_name = Column(String, nullable=False)
+    target_type = Column(String, nullable=False) # 'User' or 'Organization'
+    repository_selection = Column(String, nullable=False) # 'all' or 'selected'
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AnalysisJob(Base):
     """
     DB-backed async job state. Survives process restarts / free-tier idle spin-down.
@@ -82,4 +94,4 @@ class AnalysisJob(Base):
 
 
 # Indexes for common lookups (created separately from table def for clarity)
-__all__ = ["Base", "Repository", "RepoChunk", "GraphNode", "GraphEdge", "AnalysisJob"]
+__all__ = ["Base", "Repository", "RepoChunk", "GraphNode", "GraphEdge", "AnalysisJob", "GithubInstallation"]

@@ -13,3 +13,5 @@ tree_sitter<0.22.0
 tree_sitter_languages
 langchain-text-splitters
 pgvector
+PyJWT
+cryptography

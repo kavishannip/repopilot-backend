@@ -8,6 +8,13 @@ class Settings(BaseSettings):
     # ── GitHub ───────────────────────────────────────────────
     github_token: str = ""
     github_raw_concurrency: int = 8
+    
+    # ── GitHub App ───────────────────────────────────────────
+    github_app_id: str = ""
+    github_app_private_key: str = ""
+    github_app_webhook_secret: str = ""
+    github_app_client_id: str = ""
+    github_app_client_secret: str = ""
 
     # ── NVIDIA NIM (used for both embeddings AND LLM) ────────
     nvidia_api_key: str = ""

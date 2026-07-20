@@ -329,12 +329,14 @@ class RateLimitExceededError(Exception):
 
 
 class GitHubClient:
-    def __init__(self):
+    def __init__(self, installation_token: str = None):
         self.headers = {
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "RepoPilot"
         }
-        if settings.github_token:
+        if installation_token:
+            self.headers["Authorization"] = f"Bearer {installation_token}"
+        elif settings.github_token:
             self.headers["Authorization"] = f"Bearer {settings.github_token}"
         self._raw_download_semaphore = None
 

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from .config import settings
 from app.api.endpoints import router as analyzer_router
+from app.api.github import router as github_router
 
 app = FastAPI(
     title="RepoPilot API",
@@ -9,6 +10,7 @@ app = FastAPI(
 )
 
 app.include_router(analyzer_router, prefix="/api/analyzer", tags=["Analyzer"])
+app.include_router(github_router, prefix="/api/github", tags=["GitHub App"])
 
 @app.get("/")
 def read_root():
