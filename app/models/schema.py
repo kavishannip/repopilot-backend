@@ -4,7 +4,6 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy import Index
 import uuid
-from pgvector.sqlalchemy import HALFVEC
 
 Base = declarative_base()
 
@@ -24,21 +23,10 @@ class Repository(Base):
     last_accessed_at = Column(DateTime, default=datetime.utcnow) # For LRU cache eviction
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    chunks = relationship("RepoChunk", back_populates="repository", cascade="all, delete-orphan")
     nodes = relationship("GraphNode", back_populates="repository", cascade="all, delete-orphan")
     edges = relationship("GraphEdge", back_populates="repository", cascade="all, delete-orphan")
 
-class RepoChunk(Base):
-    __tablename__ = "repo_chunks"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
-    repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
-    chunk_text = Column(Text, nullable=False)
-    embedding = Column(HALFVEC(2048)) # Nvidia nemotron-3-embed-1b (storage optimized)
-    chunk_metadata = Column(JSONB)
-
-    repository = relationship("Repository", back_populates="chunks")
 
 class GraphNode(Base):
     __tablename__ = "graph_nodes"
@@ -92,4 +80,4 @@ class AnalysisJob(Base):
 
 
 # Indexes for common lookups (created separately from table def for clarity)
-__all__ = ["Base", "Repository", "RepoChunk", "GraphNode", "GraphEdge", "AnalysisJob", "GithubInstallation"]
+__all__ = ["Base", "Repository", "GraphNode", "GraphEdge", "AnalysisJob", "GithubInstallation"]

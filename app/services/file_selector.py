@@ -141,8 +141,8 @@ class SmartFileSelector:
         if len(must_keep_paths) > MAX_FILE_COUNT:
             logger.warning(
                 f"This repository has {len(must_keep_paths)} critical/entry-point/config files, "
-                f"which exceeds the {MAX_FILE_COUNT}-file chunking budget. "
-                f"Proceeding anyway to maintain accuracy, but this may cause large embedding costs."
+                f"which exceeds the {MAX_FILE_COUNT}-file context budget. "
+                f"Proceeding anyway to maintain accuracy, but this may cause context window truncation."
             )
 
         # ── Step 1: If smart selection disabled, return up to MAX_FILE_COUNT ──
@@ -195,7 +195,7 @@ class SmartFileSelector:
 
         if total > MAX_FILE_COUNT:
             logger.warning(
-                f"Analysis requires {total} files but the chunking budget is {MAX_FILE_COUNT}. "
+                f"Analysis requires {total} files but the context budget is {MAX_FILE_COUNT}. "
                 "Proceeding with all required files to ensure accuracy."
             )
 

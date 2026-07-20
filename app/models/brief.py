@@ -25,6 +25,9 @@ class TechItem(BaseModel):
 
 class LLMRepoBrief(BaseModel):
     # Core fields
+    sample_coverage_note: str = Field(
+        description="A required disclaimer stating exactly how many files were reviewed out of the total, and explicitly noting that architectural and unused code claims are impressions based on a partial sample."
+    )
     tech_stack: List[TechItem] = Field(
         description="List of main technologies with versions and categories"
     )

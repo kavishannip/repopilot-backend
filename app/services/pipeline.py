@@ -4,10 +4,8 @@ from sqlalchemy import delete
 from typing import List, Dict, Any, Optional
 
 from app.database import async_session
-from app.models.schema import Repository, RepoChunk, GraphNode, GraphEdge
+from app.models.schema import Repository, GraphNode, GraphEdge
 from app.services.github_client import GitHubClient, RepoSizeExceededError, RepoTooComplexError
-from app.services.chunker import CodeChunker
-from app.services.embedding import NVIDIAEmbeddingClient
 from app.config import settings
 from datetime import datetime
 from sqlalchemy import func
@@ -18,8 +16,7 @@ logger = logging.getLogger(__name__)
 
 class ProcessingPipeline:
     def __init__(self):
-        self.chunker = CodeChunker()
-        self.embedder = NVIDIAEmbeddingClient()
+        pass
         
     async def get_github_client(self, repo_url: str) -> GitHubClient:
         from app.database import async_session
@@ -79,22 +76,19 @@ class ProcessingPipeline:
                 repo_obj.last_accessed_at = datetime.utcnow()
                 await session.commit()
 
-                stmt_count = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
-                res = await session.execute(stmt_count)
-                chunks = res.scalars().all()
+                # Get selected paths from the graph nodes instead of chunks
+                stmt_nodes = select(GraphNode).where(GraphNode.repository_id == repo_obj.id, GraphNode.type == "file")
+                res = await session.execute(stmt_nodes)
+                nodes = res.scalars().all()
 
-                selected_paths = set()
-                for c in chunks:
-                    path = c.chunk_metadata.get("path")
-                    if path:
-                        selected_paths.add(path)
+                selected_paths = [n.path for n in nodes]
 
                 return {
                     "status": "cached",
                     "repo_url": repo_url,
                     "commit_sha": commit_sha,
-                    "chunks_count": len(chunks),
-                    "selected_files": list(selected_paths),
+                    "chunks_count": 0,
+                    "selected_files": selected_paths,
                     "tree_data": None,  # not re-fetched on cache hit; summarizer will fetch its own
                 }
 
@@ -118,8 +112,7 @@ class ProcessingPipeline:
                 repo_obj.description = meta["description"]
                 repo_obj.last_accessed_at = datetime.utcnow()
 
-                # Delete stale chunks and graph
-                await session.execute(delete(RepoChunk).where(RepoChunk.repository_id == repo_obj.id))
+                # Delete stale graph
                 await session.execute(delete(GraphNode).where(GraphNode.repository_id == repo_obj.id))
                 await session.execute(delete(GraphEdge).where(GraphEdge.repository_id == repo_obj.id))
 
@@ -212,172 +205,4 @@ class ProcessingPipeline:
             resp.raise_for_status()
             return resp.json()["sha"]
 
-    async def search_chunks(self, query: str, repo_url: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        query_embedding = await self.embedder.embed_chunks([query], input_type="query")
-        if not query_embedding:
-            return []
 
-        q_vec = query_embedding[0]
-
-        async with async_session() as session:
-            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
-            repo_res = await session.execute(stmt_repo)
-            repo_obj = repo_res.scalar_one_or_none()
-
-            if not repo_obj:
-                raise ValueError(f"Repository {repo_url} not found in database.")
-
-            stmt = (
-                select(RepoChunk, RepoChunk.embedding.cosine_distance(q_vec).label("distance"))
-                .where(RepoChunk.repository_id == repo_obj.id)
-                .order_by("distance")
-                .limit(top_k)
-            )
-
-            res = await session.execute(stmt)
-            results = []
-            for chunk, distance in res:
-                results.append({
-                    "id": chunk.id,
-                    "text": chunk.chunk_text,
-                    "metadata": chunk.chunk_metadata,
-                    "distance": distance
-                })
-
-            return results
-
-    async def embed_agent_files(self, repo_url: str, commit_sha: str, agent_read_files: Dict[str, str]) -> None:
-        """
-        Step 8: Lazy chat-only embedding. 
-        Takes the files the agent read in Step 4, chunks them, and saves to DB.
-        If chunks already exist for this commit, skips embedding.
-        """
-        async with async_session() as session:
-            stmt = select(Repository).where(Repository.repo_url == repo_url)
-            repo = (await session.execute(stmt)).scalar_one_or_none()
-            if not repo or repo.commit_sha != commit_sha:
-                print("Repo not found or commit mismatch. Cannot embed chat files.")
-                return
-
-            chunk_count = await session.scalar(
-                select(func.count()).select_from(RepoChunk).where(RepoChunk.repository_id == repo.id)
-            )
-            if chunk_count and chunk_count > 0:
-                print(f"Skipping embedding for {repo_url} - chunks already exist for this commit.")
-                return
-
-        print(f"Embedding {len(agent_read_files)} agent-read files for chat...")
-        all_chunks = []
-        for path, content in agent_read_files.items():
-            if content:
-                try:
-                    all_chunks.extend(self.chunker.chunk_file(path, content))
-                except Exception as e:
-                    logger.warning("Failed to chunk %s: %r", path, e)
-
-        if not all_chunks:
-            return
-
-        texts = [c["text"] for c in all_chunks]
-        embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
-
-        async with async_session() as session:
-            stmt = select(Repository).where(Repository.repo_url == repo_url)
-            repo = (await session.execute(stmt)).scalar_one_or_none()
-            if not repo: return
-
-            db_chunks = []
-            for i, c in enumerate(all_chunks):
-                clean_text = c["text"].replace("\x00", "")
-                clean_metadata = {
-                    k: v.replace("\x00", "") if isinstance(v, str) else v
-                    for k, v in c["metadata"].items()
-                }
-                db_chunks.append(
-                    RepoChunk(
-                        repository_id=repo.id,
-                        chunk_text=clean_text,
-                        chunk_metadata=clean_metadata,
-                        embedding=embeddings[i]
-                    )
-                )
-            session.add_all(db_chunks)
-            await session.commit()
-            print(f"Saved {len(db_chunks)} lazy-embedded chunks to DB.")
-
-    async def search_chunks_by_queries(
-        self,
-        queries: List[str],
-        repo_url: str,
-        top_k: int = 5,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Batch-embed multiple search queries and run per-query vector lookups.
-        This saves one external embedding request per targeted architecture query.
-        """
-        if not queries:
-            return {}
-
-        query_embeddings = await self.embedder.embed_chunks(queries, input_type="query")
-        if not query_embeddings:
-            return {query: [] for query in queries}
-
-        async with async_session() as session:
-            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
-            repo_res = await session.execute(stmt_repo)
-            repo_obj = repo_res.scalar_one_or_none()
-
-            if not repo_obj:
-                raise ValueError(f"Repository {repo_url} not found in database.")
-
-            results_by_query: Dict[str, List[Dict[str, Any]]] = {}
-            for query, q_vec in zip(queries, query_embeddings):
-                stmt = (
-                    select(RepoChunk, RepoChunk.embedding.cosine_distance(q_vec).label("distance"))
-                    .where(RepoChunk.repository_id == repo_obj.id)
-                    .order_by("distance")
-                    .limit(top_k)
-                )
-                res = await session.execute(stmt)
-                results_by_query[query] = [
-                    {
-                        "id": chunk.id,
-                        "text": chunk.chunk_text,
-                        "metadata": chunk.chunk_metadata,
-                        "distance": distance,
-                    }
-                    for chunk, distance in res
-                ]
-
-            return results_by_query
-
-    async def get_repository_chunks(
-        self,
-        repo_url: str,
-        max_text_chars_per_chunk: int = 2000,
-    ) -> List[Dict[str, Any]]:
-        """
-        Return all stored chunks for a processed repo.
-        Used by deterministic static analysis so absence from semantic search does
-        not become a false "unused dependency" or README contradiction.
-        """
-        async with async_session() as session:
-            stmt_repo = select(Repository).where(Repository.repo_url == repo_url)
-            repo_res = await session.execute(stmt_repo)
-            repo_obj = repo_res.scalar_one_or_none()
-
-            if not repo_obj:
-                raise ValueError(f"Repository {repo_url} not found in database.")
-
-            stmt = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
-            res = await session.execute(stmt)
-            chunks = res.scalars().all()
-
-            return [
-                {
-                    "id": chunk.id,
-                    "text": chunk.chunk_text[:max_text_chars_per_chunk],
-                    "metadata": chunk.chunk_metadata or {},
-                }
-                for chunk in chunks
-            ]

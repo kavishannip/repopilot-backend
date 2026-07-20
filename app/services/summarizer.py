@@ -86,8 +86,6 @@ TECH_EVIDENCE_PATTERNS: Dict[str, List[Tuple[str, str]]] = {
 def _analyze_dependency_usage(
     parsed_manifests: Dict[str, Any],
     full_file_contents: Dict[str, str],
-    search_context: Dict[str, List[Dict[str, Any]]],
-    all_chunks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Cross-reference manifest deps against observed imports in analyzed code.
@@ -151,20 +149,7 @@ def _analyze_dependency_usage(
     for path, content in full_file_contents.items():
         add_imports_from_text(content, path)
 
-    # Also pull from chunk metadata (chunker already extracted imports)
-    for chunks in search_context.values():
-        for chunk in chunks:
-            path = chunk.get("metadata", {}).get("path", "unknown")
-            add_imports_from_text(chunk.get("text", ""), path)
-            for imp_line in chunk.get("metadata", {}).get("imports", []):
-                add_imports_from_text(imp_line, path)
 
-    for chunk in all_chunks or []:
-        metadata = chunk.get("metadata", {})
-        path = metadata.get("path", "unknown")
-        add_imports_from_text(chunk.get("text", ""), path)
-        for imp_line in metadata.get("imports", []):
-            add_imports_from_text(imp_line, path)
 
     # Match declared deps against imported
     result = {}
@@ -192,7 +177,6 @@ def _analyze_dependency_usage(
 
 
 def _build_positive_tech_evidence(
-    all_chunks: List[Dict[str, Any]],
     full_file_contents: Dict[str, str],
 ) -> Dict[str, List[str]]:
     """Find positive technology usage evidence across selected code chunks."""
@@ -211,22 +195,13 @@ def _build_positive_tech_evidence(
     for path, content in full_file_contents.items():
         scan_text(content, path)
 
-    for chunk in all_chunks:
-        metadata = chunk.get("metadata", {})
-        path = metadata.get("path", "unknown")
-        start = metadata.get("start_line")
-        label = f"{path}:L{start}" if start else path
-        scan_text(chunk.get("text", ""), label)
-        for import_line in metadata.get("imports", []):
-            scan_text(import_line, label)
+
 
     return {tech: refs[:10] for tech, refs in evidence.items()}
 
 
 def _analyze_env_vars(
     full_file_contents: Dict[str, str],
-    search_context: Dict[str, List[Dict[str, Any]]],
-    all_chunks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, List[str]]:
     """
     Grep code for env var reads. Returns {VAR_NAME: [file_path, ...]}.
@@ -261,18 +236,7 @@ def _analyze_env_vars(
     for file_path, content in full_file_contents.items():
         scan_text(content, file_path)
 
-    for chunks in search_context.values():
-        for chunk in chunks:
-            path = chunk["metadata"].get("path", "unknown")
-            start = chunk["metadata"].get("start_line", "")
-            label = f"{path}:L{start}" if start else path
-            scan_text(chunk["text"], label)
 
-    for chunk in all_chunks or []:
-        path = chunk.get("metadata", {}).get("path", "unknown")
-        start = chunk.get("metadata", {}).get("start_line", "")
-        label = f"{path}:L{start}" if start else path
-        scan_text(chunk.get("text", ""), label)
 
     return env_vars
 
@@ -391,16 +355,11 @@ class RepoSummarizer:
         dep_usage = _analyze_dependency_usage(
             structural_context["parsed_manifests"],
             structural_context["full_file_contents"],
-            {},
-            [],
         )
         env_vars = _analyze_env_vars(
             structural_context["full_file_contents"],
-            {},
-            [],
         )
         tech_evidence = _build_positive_tech_evidence(
-            [],
             structural_context["full_file_contents"],
         )
         structural_context["tech_evidence"] = tech_evidence
@@ -855,6 +814,13 @@ You have been given:
 
 Your task: produce a HIGHLY ACCURATE RepoBrief that could let someone draw an architecture diagram.
 
+CRITICAL CONTEXT CAVEAT:
+You are only viewing a *PARTIAL SAMPLE* of the repository's files. The files you see were selected by a heuristic scout and an autonomous agent. 
+- You MUST populate the `sample_coverage_note` field explicitly stating that your analysis is based on a partial sample of files.
+- ANY claims you make about data flow, architecture type (e.g. monolith vs microservices), or "unused code" are IMPRESSIONS based on this partial sample, NOT verifiable absolute truths.
+- In contrast, your `tech_stack` and `env_vars` fields ARE grounded in the actual manifests and code you read.
+- Use language like "Based on the files reviewed..." for architectural claims rather than absolute statements.
+
 STRICT RULES:
 - API endpoints: report HTTP methods ONLY from actual route handler code (@app.get, router.post, app.use). NEVER infer from folder names.
 - Architecture type: Treat the ARCHITECTURE VERDICT as verified ground truth. Do not label as 'microservices' if the verdict says there is only 1 connected component.
@@ -872,6 +838,7 @@ STRICT RULES:
 - JSON TEMPLATE EXPECTATION: Your JSON must strictly mirror this structure:
 ```json
 {
+  "sample_coverage_note": "Analyzed a partial sample of critical entry points and files read by the agent out of the total repository.",
   "tech_stack": [{"name": "React", "version": "18", "category": "framework", "purpose": "UI"}],
   "architecture_summary": "Detailed string here...",
   "entry_points": [{"file_path": "main.py", "description": "Entry"}],

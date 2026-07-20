@@ -2,8 +2,10 @@ import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.prebuilt import create_react_agent
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from langchain_groq import ChatGroq
 from app.config import settings
 from app.services.github_client import GitHubClient
@@ -28,7 +30,10 @@ class GitHubToolkitAsync:
 
     def get_tools(self):
         
-        @tool
+        class ListFilesArgs(BaseModel):
+            directory: str = Field(default="", description="The directory path to list. Leave empty for root.")
+            
+        @tool(args_schema=ListFilesArgs)
         async def list_files(directory: str = "") -> str:
             """
             List all files and directories in the repository, optionally filtered by a specific directory path.
@@ -55,7 +60,10 @@ class GitHubToolkitAsync:
                 return f"Found {len(results)} files. Showing first 200:\n" + "\n".join(results[:200])
             return "\n".join(results)
 
-        @tool
+        class GetFileContentsArgs(BaseModel):
+            file_path: str = Field(description="The exact file path to read.")
+
+        @tool(args_schema=GetFileContentsArgs)
         async def get_file_contents(file_path: str) -> str:
             """
             Get the full contents of a specific file in the repository.
@@ -78,7 +86,10 @@ class GitHubToolkitAsync:
             
             return f"--- {file_path} ---\n{content}"
 
-        @tool
+        class GetMultipleFilesArgs(BaseModel):
+            file_paths: List[str] = Field(description="List of exact file paths to read.")
+
+        @tool(args_schema=GetMultipleFilesArgs)
         async def get_multiple_files(file_paths: List[str]) -> str:
             """
             Get the full contents of multiple files in a single call.
@@ -109,10 +120,10 @@ class AgentExplorer:
     def __init__(self, github: GitHubClient):
         self.github = github
         # We need a 70B model or equivalent for agent loops.
-        model_name = settings.groq_model or "llama-3.3-70b-versatile"
-        self.llm = ChatGroq(
-            api_key=settings.groq_api_key,
-            model=model_name,
+        # Switching from Groq to NVIDIA NIM to avoid Groq's XML parsing bugs and TPM limits
+        self.llm = ChatNVIDIA(
+            api_key=settings.nvidia_api_key,
+            model="meta/llama-3.1-70b-instruct",
             temperature=0.0,
             max_tokens=2048,
         )
@@ -130,6 +141,10 @@ class AgentExplorer:
         toolkit = GitHubToolkitAsync(self.github, repo_url, branch)
         tools = toolkit.get_tools()
         
+        ascii_tree_str = hints.get('ascii_tree', '')
+        if len(ascii_tree_str) > 3000:
+            ascii_tree_str = ascii_tree_str[:3000] + "\n... (tree truncated)"
+
         system_prompt = f"""You are an expert software architect analyzing a repository.
 Your goal is to explore the repository and read the most critical files to understand its architecture, data flow, and components.
 You have been provided with some pre-computed hints to guide your exploration. Do NOT explore blindly.
@@ -140,24 +155,25 @@ Critical files: {hints.get('classification', {}).get('critical', [])}
 Entry points: {hints.get('classification', {}).get('entry_points', [])}
 
 Repository tree summary:
-{hints.get('ascii_tree', '')}
+{ascii_tree_str}
 
 INSTRUCTIONS:
 1. Use list_files to explore directories of interest.
 2. Use get_file_contents or get_multiple_files to read the actual code.
 3. Focus on reading entry points, API routes, database schemas, and core business logic.
 4. Once you have read enough files to understand the core architecture (or if you run out of things to check), use the Final Answer to summarize briefly what you found. The actual files you read are automatically collected in the background.
+5. CRITICAL: You must use the official JSON tool calling API. Do NOT output raw XML or <function> tags.
 """
 
         agent = create_react_agent(self.llm, tools, prompt=system_prompt)
         
         try:
             logger.info(f"Starting agent exploration for {repo_url}...")
-            # We run it in async mode with a 2-minute timeout and 20 max steps (recursion_limit)
+            # We run it in async mode with a 2-minute timeout and 12 max steps (recursion_limit)
             await asyncio.wait_for(
                 agent.ainvoke(
                     {"messages": [HumanMessage(content="Begin exploration.")]},
-                    {"recursion_limit": 20}
+                    {"recursion_limit": 12}
                 ),
                 timeout=120.0
             )
