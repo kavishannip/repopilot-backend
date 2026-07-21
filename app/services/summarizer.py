@@ -79,6 +79,103 @@ TECH_EVIDENCE_PATTERNS: Dict[str, List[Tuple[str, str]]] = {
 }
 
 
+def _repair_json_string(json_str: str) -> str:
+    """Fix common LLM JSON syntax issues like trailing commas or unescaped tabs."""
+    cleaned = re.sub(r',\s*([}\]])', r'\1', json_str)
+    cleaned = cleaned.replace('\t', '  ')
+    return cleaned
+
+
+def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
+    """
+    Robust multi-strategy JSON extractor for LLM outputs.
+    Handles thinking CoT blocks (<think>...</think>), markdown code blocks,
+    non-greedy brace scanning, and minor JSON syntax repairs.
+    """
+    if isinstance(raw_content, list):
+        parts = []
+        for block in raw_content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        text = "\n".join(parts)
+    elif not isinstance(raw_content, str):
+        text = str(raw_content)
+    else:
+        text = raw_content
+
+    # 0. Strip CoT reasoning tags if present
+    text_clean = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    if not text_clean:
+        text_clean = text
+
+    # 1. Check for markdown code blocks ```json ... ``` or ``` ... ```
+    code_block_matches = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', text_clean, re.DOTALL)
+    for block in code_block_matches:
+        try:
+            return json.loads(block)
+        except Exception:
+            repaired = _repair_json_string(block)
+            try:
+                return json.loads(repaired)
+            except Exception:
+                continue
+
+    # 2. Balanced brace depth scanning for outer JSON object
+    start_idx = text_clean.find('{')
+    while start_idx != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        end_idx = -1
+        for i in range(start_idx, len(text_clean)):
+            char = text_clean[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == '"':
+                    in_string = False
+            else:
+                if char == '"':
+                    in_string = True
+                elif char == '{':
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i
+                        break
+        if end_idx != -1:
+            candidate = text_clean[start_idx:end_idx + 1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                repaired = _repair_json_string(candidate)
+                try:
+                    return json.loads(repaired)
+                except Exception:
+                    pass
+        start_idx = text_clean.find('{', start_idx + 1)
+
+    # 3. Fallback greedy regex search
+    greedy_match = re.search(r'\{.*\}', text_clean, re.DOTALL)
+    if greedy_match:
+        candidate = greedy_match.group(0)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            repaired = _repair_json_string(candidate)
+            try:
+                return json.loads(repaired)
+            except Exception as e:
+                raise ValueError(f"Failed to parse LLM JSON candidate: {e}")
+
+    raise ValueError("No valid JSON object found in LLM output")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Static analysis helpers (deterministic — injected as ground truth)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1212,9 +1309,7 @@ GitHub metadata:
 Now produce the complete RepoBrief with all evidenced fields populated accurately. Prefer "Not evidenced in the analyzed files" over unsupported guesses."""
 
         parser = PydanticOutputParser(pydantic_object=LLMRepoBrief)
-        format_instructions = parser.get_format_instructions()
-        
-        system_prompt += f"\n\n{format_instructions}"
+        system_prompt += f"\n\n{format_instructions}\n\nCRITICAL FORMAT REQUIREMENT:\nYou MUST enclose your final JSON output inside a single markdown code block:\n```json\n{{\n  ...\n}}\n```\nDo NOT add any text outside the code block."
 
         print(f"  Calling NVIDIA reasoning LLM ({settings.repo_analizer_model}, thinking={settings.llm_enable_thinking})...")
         t_start = time.time()
@@ -1227,18 +1322,13 @@ Now produce the complete RepoBrief with all evidenced fields populated accuratel
         try:
             brief = parser.invoke(res)
         except Exception as e:
-            # Fallback if parser fails due to cut-off or weird format
-            print(f"  [Pass 4] Parse warning: {e}. Trying raw json extraction...")
-            import json
-            import re
-            match = re.search(r'\{.*\}', res.content, re.DOTALL)
-            if match:
-                try:
-                    brief = LLMRepoBrief.model_validate_json(match.group(0))
-                except Exception as inner_e:
-                    raise ValueError(f"Failed to parse LLM JSON: {inner_e}")
-            else:
-                raise ValueError("No JSON object found in LLM output")
+            print(f"  [Pass 4] Parser warning: {e}. Executing robust multi-strategy JSON extraction...")
+            try:
+                json_data = _extract_json_payload(res.content)
+                brief = LLMRepoBrief.model_validate(json_data)
+            except Exception as inner_e:
+                logger.error(f"  [Pass 4] Robust JSON extraction failed: {inner_e}")
+                raise ValueError(f"Failed to parse LLM JSON: {inner_e}")
 
         duration = time.time() - t_start
         print(f"  [Pass 4] NVIDIA synthesis: {duration:.1f}s")
