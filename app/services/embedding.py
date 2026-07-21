@@ -184,6 +184,7 @@ class NVIDIAEmbeddingClient:
                 is_server_error = status_code in (500, 502, 504)
 
                 if attempt < max_retries - 1:
+                    wait_time = None
                     # Check for Retry-After header
                     retry_after_hdr = e.response.headers.get("Retry-After") or e.response.headers.get("retry-after")
                     if retry_after_hdr:
@@ -195,6 +196,7 @@ class NVIDIAEmbeddingClient:
                             )
                         except ValueError:
                             wait_time = None
+
                     if wait_time is None:
                         if is_rate_limit:
                             # Dynamically step up inter-request pacing delay to alleviate API gateway congestion
