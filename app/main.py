@@ -1,16 +1,16 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
-from .config import settings
 from app.api.endpoints import router as analyzer_router
-from app.api.github import router as github_router
 
 app = FastAPI(
     title="RepoPilot API",
-    description="Repo analyzer backend",
-    version="0.1.0"
+    description="Repo analyzer backend (LangChain Agent)",
+    version="0.2.0"
 )
 
 app.include_router(analyzer_router, prefix="/api/analyzer", tags=["Analyzer"])
-app.include_router(github_router, prefix="/api/github", tags=["GitHub App"])
 
 @app.get("/")
 def read_root():
@@ -18,7 +18,7 @@ def read_root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "db_url_set": bool(settings.database_url)}
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
