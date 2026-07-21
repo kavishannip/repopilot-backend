@@ -338,6 +338,157 @@ class RepoSummarizer:
         self.repo_map_builder = RepoMap()
         self.github = GitHubClient()
 
+    async def generate_quick_summary(self, repo_url: str) -> str:
+        """
+        Fast AI summary of the repo based on metadata, README, and package files.
+        Uses Groq (fast_llm) to produce a rapid response.
+        """
+        from langchain_core.messages import SystemMessage, HumanMessage
+        import fnmatch
+
+        print(f"\n[Quick Summary] Starting for {repo_url}...")
+        meta = await self.github.get_repo_metadata(repo_url)
+        branch = meta["default_branch"]
+
+        tree_data = await self.github.get_file_tree_structure(repo_url, branch)
+        classification = tree_data["classification"]
+
+        files_to_read = []
+        # Get README
+        readme_files = [f for f in classification["critical"] if f.lower().split("/")[-1].startswith("readme")]
+        if readme_files:
+            files_to_read.append(readme_files[0])
+            
+        # Get package manifests
+        manifest_names = {
+    # JavaScript / TypeScript / Node
+    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "bun.lockb", "tsconfig.json", "deno.json", "deno.jsonc",
+
+    # Python
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "Pipfile", "Pipfile.lock", "poetry.lock", "environment.yml",
+    "tox.ini", "conda.yaml",
+
+    # Go
+    "go.mod", "go.sum",
+
+    # Java / Kotlin / JVM
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "ivy.xml",
+
+    # Rust
+    "Cargo.toml", "Cargo.lock",
+
+    # Ruby
+    "Gemfile", "Gemfile.lock", "*.gemspec",
+
+    # PHP
+    "composer.json", "composer.lock",
+
+    # C# / .NET
+    "*.csproj", "*.fsproj", "*.vbproj", "*.sln", "packages.config",
+    "nuget.config", "Directory.Build.props",
+
+    # C / C++
+    "CMakeLists.txt", "Makefile", "makefile", "meson.build",
+    "conanfile.txt", "conanfile.py", "vcpkg.json",
+
+    # Swift / Objective-C
+    "Package.swift", "Podfile", "Podfile.lock", "*.xcodeproj",
+    "*.xcworkspace",
+
+    # Dart / Flutter
+    "pubspec.yaml", "pubspec.lock",
+
+    # Elixir / Erlang
+    "mix.exs", "mix.lock", "rebar.config",
+
+    # Haskell
+    "*.cabal", "stack.yaml", "package.yaml",
+
+    # Scala
+    "build.sbt",
+
+    # Perl
+    "Makefile.PL", "cpanfile",
+
+    # R
+    "DESCRIPTION", "renv.lock",
+
+    # Julia
+    "Project.toml", "Manifest.toml",
+
+    # Lua
+    "*.rockspec",
+
+    # Zig
+    "build.zig",
+
+    # Nix
+    "flake.nix", "default.nix", "shell.nix",
+
+    # Containers / Infra
+    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "Vagrantfile", "Procfile",
+
+    # Terraform / IaC
+    "main.tf", "terraform.tfvars",
+
+    # General / monorepo tooling
+    "lerna.json", "nx.json", "turbo.json", "rush.json",
+    "Makefile.toml", "justfile", "Justfile",
+
+    # Version control / project markers
+    ".gitmodules",
+}
+        manifest_files = []
+        for f in classification["critical"]:
+            filename = f.split("/")[-1]
+            if any(fnmatch.fnmatch(filename, pat) for pat in manifest_names):
+                manifest_files.append(f)
+                
+        files_to_read.extend(manifest_files[:5]) # limit to 5 manifests
+
+        print(f"  [Quick Summary] Reading {len(files_to_read)} files for fast analysis...")
+        full_file_contents = await self.github.get_files_content_batch(
+            repo_url,
+            files_to_read,
+            branch=branch,
+            max_chars_per_file=8000,
+        )
+
+        context_blocks = []
+        for path, content in full_file_contents.items():
+            context_blocks.append(f"--- {path} ---\n{content[:4000]}")
+            
+        context_str = "\n\n".join(context_blocks)
+        
+        # Only include meaningful metadata for the LLM
+        meta_parts = [f"Repository: {meta.get('full_name')}"]
+        if meta.get('description'):
+            meta_parts.append(f"Description: {meta.get('description')}")
+        if meta.get('language'):
+            meta_parts.append(f"Primary Language: {meta.get('language')}")
+            
+        meta_str = "\n".join(meta_parts)
+
+        messages = [
+            SystemMessage(content=(
+                "You are an expert developer assistant. Provide a rapid, high-level summary of this repository. "
+                "Based on the repository metadata, README, and package dependencies provided, describe: "
+                "1) What the project is and its primary purpose. "
+                "2) The core technology stack and frameworks used. "
+                "Keep the summary concise (max 3-4 paragraphs) and highly technical."
+            )),
+            HumanMessage(content=f"{meta_str}\n\nFiles Content:\n{context_str}"),
+        ]
+
+        print("  [Quick Summary] Calling LLM...")
+        result = await self.fast_llm.ainvoke(messages)
+        print("  [Quick Summary] Done.")
+        return result.content
+
     async def generate_brief(self, repo_url: str, job_id: Optional[str] = None) -> RepoBrief:
         """
         Main entry: 4-pass pipeline to generate comprehensive, accurate repo brief.
@@ -389,7 +540,7 @@ class RepoSummarizer:
         # ── Pass 3: Parallel file-group summaries (with caching) ──────
         await set_phase("group_summaries")
         t3 = time.time()
-        print("\n[Pass 3] Generating file-group summaries (Groq, map-reduce)...")
+        print("\n[Pass 3] Generating file-group summaries (NVIDIA NIM, map-reduce)...")
         group_summaries = await self._generate_group_summaries(
             structural_context, search_context, repo_url, commit_sha
         )
@@ -727,7 +878,7 @@ class RepoSummarizer:
         top_groups = sorted_groups[:MAX_SOURCE_GROUPS]
 
         print(f"  Summarizing {len(top_groups)} file groups "
-              f"(Groq:{settings.groq_model}, concurrency:{settings.phase3_concurrency})...")
+              f"(NVIDIA NIM, concurrency:{settings.phase3_concurrency})...")
         sem = asyncio.Semaphore(settings.phase3_concurrency)
 
         async def summarize_group(group_key: str, file_texts: List[str], index: int) -> Tuple[str, Optional[int], Optional[int]]:
@@ -755,13 +906,13 @@ class RepoSummarizer:
                         usage = getattr(result, "response_metadata", {}).get("token_usage", {})
                         prompt_tok = usage.get("prompt_tokens", "?")
                         comp_tok = usage.get("completion_tokens", "?")
-                        logger.debug(f"  [Phase 3] Group '{group_key}': {prompt_tok}p/{comp_tok}c tokens")
+                        print(f"    [Pass 3 - Sub-step] Group '{group_key}' completed ({prompt_tok}p/{comp_tok}c tokens)")
                         return f"[{group_key}]\n{result.content}", prompt_tok, comp_tok
                     except Exception as e:
                         error_msg = str(e)
                         if "429" in error_msg and attempt < max_retries - 1:
                             wait_time = 3 ** (attempt + 1)  # 3s, 9s, 27s
-                            print(f"  [429 Rate Limit] Group '{group_key}' (Groq) retrying in {wait_time}s...")
+                            print(f"  [429 Rate Limit] Group '{group_key}' (NVIDIA NIM) retrying in {wait_time}s...")
                             await asyncio.sleep(wait_time)
                         else:
                             print(f"  Group summary failed for '{group_key}': {e}")
@@ -775,7 +926,7 @@ class RepoSummarizer:
         total_prompt = sum(r[1] for r in raw_results if r[1] is not None)
         total_comp = sum(r[2] for r in raw_results if r[2] is not None)
         print(f"  Generated {len(summaries)} group summaries | "
-              f"Groq tokens: ~{total_prompt}p / ~{total_comp}c")
+              f"NVIDIA NIM tokens: ~{total_prompt}p / ~{total_comp}c")
 
         # Persist to DB cache
         async with async_session() as session:

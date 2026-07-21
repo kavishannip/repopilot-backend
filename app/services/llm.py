@@ -8,26 +8,26 @@ Swap Groq model anytime via GROQ_MODEL env var without code changes.
 """
 
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
-from langchain_groq import ChatGroq
 from app.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
-
-def get_fast_llm() -> ChatGroq:
+def get_fast_llm() -> ChatNVIDIA:
     """
-    Phase 3 (group summaries): Groq inference.
-    Fast, generous free-tier RPM/RPD, handles simple summarization well.
-    Model is configurable via GROQ_MODEL env var.
+    Phase 3 (group summaries): NVIDIA NIM (Fast model).
+    Replaces Groq. Uses a smaller, faster model (Llama 3.1 8B) hosted on NVIDIA NIM 
+    to handle concurrent map-reduce summarization tasks efficiently without hitting 
+    the heavy rate limits of the 120B reasoning model.
     """
-    if not settings.groq_api_key:
-        raise ValueError("GROQ_API_KEY is not set. Required for Phase 3 group summaries.")
+    if not settings.nvidia_api_key:
+        raise ValueError("NVIDIA_API_KEY is not set. Required for Phase 3 group summaries.")
 
-    logger.debug(f"[LLM] Phase 3 using Groq model: {settings.groq_model}")
-    return ChatGroq(
-        api_key=settings.groq_api_key,
-        model=settings.groq_model,
+    fast_model = "meta/llama-3.1-8b-instruct"
+    logger.debug(f"[LLM] Phase 3 using fast NVIDIA model: {fast_model}")
+    return ChatNVIDIA(
+        api_key=settings.nvidia_api_key,
+        model=fast_model,
         temperature=0.0,
         max_tokens=2048,
     )
