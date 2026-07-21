@@ -55,13 +55,14 @@ class ProcessingPipeline:
             repo_obj = result.scalar_one_or_none()
 
             if repo_obj and repo_obj.commit_sha == commit_sha:
-                print("Cache hit! Repository is up to date.")
-                repo_obj.last_accessed_at = datetime.utcnow()
-                await session.commit()
-
                 stmt_count = select(RepoChunk).where(RepoChunk.repository_id == repo_obj.id)
                 res = await session.execute(stmt_count)
                 chunks = res.scalars().all()
+
+                if len(chunks) > 0:
+                    print("Cache hit! Repository is up to date.")
+                    repo_obj.last_accessed_at = datetime.utcnow()
+                    await session.commit()
 
                 selected_paths = set()
                 for c in chunks:
