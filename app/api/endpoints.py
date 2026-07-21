@@ -20,7 +20,15 @@ logger = logging.getLogger(__name__)
 
 
 class AnalyzeRequest(BaseModel):
+    repo_id: str
+
+class QuickSummaryRequest(BaseModel):
     repo_url: str
+
+class QuickSummaryResponse(BaseModel):
+    repo_id: str
+    summary: str
+    metadata: dict
 
 
 class AnalyzeResponse(BaseModel):
@@ -83,20 +91,105 @@ async def _run_pipeline(job_id: str, repo_url: str) -> None:
         await job_manager.fail_job(job_id, str(e))
 
 
+@router.post("/quicksummary", response_model=QuickSummaryResponse)
+async def get_quick_summary(req: QuickSummaryRequest):
+    """
+    Generate a rapid summary of the repository using only metadata and key files.
+    Creates the repository in the database if it doesn't exist and returns the repo_id.
+    """
+    repo_url = req.repo_url.rstrip("/")
+    if not is_valid_github_url(repo_url):
+        raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
+
+    # Get metadata
+    try:
+        meta = await summarizer.github.get_repo_metadata(repo_url)
+    except RepoSizeExceededError as e:
+        raise HTTPException(status_code=400, detail=f"Repo exceeds size limit. {e}")
+    except RepoTooComplexError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Repository too complex for accurate analysis. {e} "
+                "Please try a focused sub-directory or a smaller repository."
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch repo metadata: {e}")
+
+    # Check if repo exists and has a quick summary
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.repo_url == repo_url)
+        result = await session.execute(stmt)
+        repo_obj = result.scalar_one_or_none()
+
+        if repo_obj and repo_obj.quick_summary:
+            # Cache hit
+            return QuickSummaryResponse(
+                repo_id=str(repo_obj.id),
+                summary=repo_obj.quick_summary,
+                metadata=meta
+            )
+
+    # Generate summary
+    try:
+        summary_text = await summarizer.generate_quick_summary(repo_url)
+    except Exception as e:
+        logger.exception("Failed to generate quick summary")
+        raise HTTPException(status_code=500, detail=f"Failed to generate quick summary: {e}")
+
+    # Save to DB
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.repo_url == repo_url)
+        result = await session.execute(stmt)
+        repo_obj = result.scalar_one_or_none()
+
+        if not repo_obj:
+            repo_obj = Repository(
+                repo_url=repo_url,
+                owner=meta.get("owner", ""),
+                name=meta.get("name", ""),
+                default_branch=meta.get("default_branch", "main"),
+                quick_summary=summary_text,
+                language=meta.get("language", ""),
+                stars=meta.get("stars", 0),
+                description=meta.get("description", "")
+            )
+            session.add(repo_obj)
+        else:
+            repo_obj.quick_summary = summary_text
+
+        await session.commit()
+        await session.refresh(repo_obj)
+        repo_id_str = str(repo_obj.id)
+
+    return QuickSummaryResponse(
+        repo_id=repo_id_str,
+        summary=summary_text,
+        metadata=meta
+    )
+
+
 @router.post("/analyze", response_model=JobSubmitResponse)
 async def analyze_repo(req: AnalyzeRequest):
     """
     Submit a repo for analysis. Returns a job_id immediately.
     Poll GET /status/{job_id} for progress and result.
-
-    If the repo brief is already cached (same commit SHA, not expired), returns
-    the brief directly in the 'result' field of the status endpoint without
-    creating a job.
+    Requires repo_id, which can be obtained from /quicksummary.
     """
-    repo_url = req.repo_url.rstrip("/")
-
-    if not is_valid_github_url(repo_url):
-        raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
+    # Fetch repo URL using repo_id
+    repo_url = None
+    commit_sha = None
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.id == req.repo_id)
+        try:
+            result = await session.execute(stmt)
+            repo_obj = result.scalar_one_or_none()
+            if not repo_obj:
+                raise HTTPException(status_code=404, detail="Repository ID not found. Call /quicksummary first.")
+            repo_url = repo_obj.repo_url
+        except Exception: # Handling UUID parse errors or bad format
+            raise HTTPException(status_code=400, detail="Invalid Repository ID format.")
 
     # 1. Validate repo + get commit SHA (fast, synchronous-ish)
     try:
@@ -129,11 +222,12 @@ async def analyze_repo(req: AnalyzeRequest):
 
             if repo_obj.updated_at and (now - repo_obj.updated_at).days >= expire_days:
                 # Expired — delete and fall through to fresh analysis
-                await session.delete(repo_obj)
+                # We can't actually delete it here because the user just fetched it via quicksummary!
+                # Wait, we can just reset brief/chunks, but let's just clear the brief.
+                repo_obj.brief = None
                 await session.commit()
             elif repo_obj.commit_sha == commit_sha and repo_obj.brief:
-                # Cache hit — create a synthetic completed job so the caller
-                # can use the same polling endpoint consistently
+                # Cache hit
                 cached_job_id = await job_manager.create_job(repo_url)
                 await job_manager.complete_job(cached_job_id, repo_obj.brief)
                 return JobSubmitResponse(
