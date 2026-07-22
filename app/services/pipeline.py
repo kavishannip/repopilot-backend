@@ -7,7 +7,7 @@ from app.database import async_session
 from app.models.schema import Repository, RepoChunk, GraphNode, GraphEdge
 from app.services.github_client import GitHubClient, RepoSizeExceededError, RepoTooComplexError
 from app.services.chunker import CodeChunker
-from app.services.embedding import NVIDIAEmbeddingClient
+from app.services.embedding import OpenAIEmbeddingClient
 from app.config import settings
 from datetime import datetime
 from sqlalchemy import func
@@ -20,7 +20,7 @@ class ProcessingPipeline:
     def __init__(self):
         self.github = GitHubClient()
         self.chunker = CodeChunker()
-        self.embedder = NVIDIAEmbeddingClient()
+        self.embedder = OpenAIEmbeddingClient()
 
     async def process_repo(self, repo_url: str) -> Dict[str, Any]:
         """

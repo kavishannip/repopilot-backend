@@ -9,21 +9,21 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-class NVIDIAEmbeddingClient:
+class OpenAIEmbeddingClient:
     def __init__(self):
-        self.api_key = settings.nvidia_api_key
-        self.url = "https://integrate.api.nvidia.com/v1/embeddings"
+        self.api_key = settings.openai_api_key
+        self.url = "https://api.openai.com/v1/embeddings"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "Accept": "application/json"
         }
-        self.model = settings.nvidia_embed_model
-        self.batch_size = getattr(settings, 'embed_batch_size', 20)
+        self.model = settings.openai_embed_model
+        self.batch_size = getattr(settings, 'embed_batch_size', 100)
+        self.vector_dim = 1536
         
-        # Token bucket for RPM limit
-        self.rpm_limit = getattr(settings, 'embed_rpm_limit', 35)
-        self.min_delay = getattr(settings, 'embed_min_delay_seconds', 2.0)
+        # Token bucket & pacing rate limiter for OpenAI
+        self.rpm_limit = getattr(settings, 'embed_rpm_limit', 3000)
+        self.min_delay = getattr(settings, 'embed_min_delay_seconds', 0.05)
         
         self.tokens = self.rpm_limit
         self.last_refill = asyncio.get_event_loop().time()
@@ -36,27 +36,22 @@ class NVIDIAEmbeddingClient:
 
     def _hash_chunk(self, text: str, input_type: str) -> str:
         """Compute deterministic SHA-256 hash for chunk caching."""
-        return hashlib.sha256(f"{input_type}:{text}".encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"{self.model}:{input_type}:{text}".encode("utf-8")).hexdigest()
 
     async def _acquire_token(self):
-        """
-        Paced Token Bucket Rate Limiter.
-        Enforces both overall RPM limit and a minimum inter-request delay (min_delay)
-        to prevent instantaneous burst spikes (503/429) on NVIDIA NIM API gateway.
-        """
+        """Paced Token Bucket Rate Limiter for OpenAI API."""
         async with self.lock:
             while True:
                 now = asyncio.get_event_loop().time()
                 
-                # 1. Pacing check: Ensure minimum delay since previous API call
+                # Pacing check: Ensure minimum delay between requests
                 elapsed_since_last = now - self.last_request_time
                 if elapsed_since_last < self.min_delay:
                     pacing_wait = self.min_delay - elapsed_since_last
-                    logger.debug(f"  [Embed] Pacing: waiting {pacing_wait:.2f}s before next request...")
                     await asyncio.sleep(pacing_wait)
                     now = asyncio.get_event_loop().time()
 
-                # 2. Token refill calculation
+                # Token refill calculation
                 time_passed = now - self.last_refill
                 new_tokens = time_passed * self.refill_rate_per_sec
                 if new_tokens > 0:
@@ -68,14 +63,12 @@ class NVIDIAEmbeddingClient:
                     self.last_request_time = asyncio.get_event_loop().time()
                     return
 
-                # Need to wait for next token refill
                 wait_time = (1 - self.tokens) / self.refill_rate_per_sec
-                logger.debug(f"  [Embed] Rate limiter: waiting {wait_time:.2f}s for next token...")
                 await asyncio.sleep(wait_time)
 
     async def embed_chunks(self, chunks: List[str], input_type: str = "passage") -> List[List[float]]:
         """
-        Embed a list of text chunks with SHA-256 deduplication and paced batching.
+        Embed a list of text chunks using OpenAI text-embedding-3-small.
         input_type: "passage" for documents, "query" for search queries.
         """
         if not chunks:
@@ -93,23 +86,14 @@ class NVIDIAEmbeddingClient:
             logger.info(f"  [Embed] Cache hit for {len(chunks) - len(uncached_indices)}/{len(chunks)} chunks")
 
         uncached_chunks = [chunks[i] for i in uncached_indices]
-        batches = [
-            uncached_chunks[i:i + self.batch_size] 
-            for i in range(0, len(uncached_chunks), self.batch_size)
-        ]
 
-        logger.info(
-            f"  [Embed] Processing {len(uncached_chunks)} uncached chunks in {len(batches)} batches "
-            f"(batch_size={self.batch_size}, pacing={self.min_delay}s)..."
-        )
-
-        # Step 2: Single persistent HTTP client for connection pooling across batches
-        limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+        # Step 2: Persistent HTTP client for connection pooling
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
         async with httpx.AsyncClient(limits=limits, timeout=60.0) as client:
             processed_count = 0
             batch_idx = 0
             while processed_count < len(uncached_chunks):
-                current_batch_size = max(5, min(self.batch_size, getattr(settings, 'embed_batch_size', 15)))
+                current_batch_size = max(10, min(self.batch_size, getattr(settings, 'embed_batch_size', 100)))
                 batch = uncached_chunks[processed_count : processed_count + current_batch_size]
                 
                 await self._acquire_token()
@@ -140,12 +124,11 @@ class NVIDIAEmbeddingClient:
         total_batches: int,
         input_type: str,
     ) -> List[List[float]]:
-        """Embed one batch with Retry-After header parsing, exponential backoff, and adaptive splitting."""
+        """Embed one batch with OpenAI API, handling retries and rate limits."""
         payload = {
             "input": batch,
             "model": self.model,
             "encoding_format": "float",
-            "input_type": input_type,
         }
         max_retries = 6
 
@@ -158,21 +141,22 @@ class NVIDIAEmbeddingClient:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                embeddings = [item["embedding"] for item in data.get("data", [])]
+                # Ensure data is sorted by index
+                raw_items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
+                embeddings = [item["embedding"] for item in raw_items]
                 logger.debug(
-                    f"  [Embed] Batch {batch_idx+1}/{total_batches}: "
-                    f"{len(batch)} chunks -> {len(embeddings)} embeddings"
+                    f"  [Embed] OpenAI Batch {batch_idx+1}/{total_batches}: "
+                    f"{len(batch)} chunks -> {len(embeddings)} embeddings ({self.vector_dim}-dim)"
                 )
                 return embeddings
 
             except httpx.HTTPStatusError as e:
                 status_code = e.response.status_code
 
-                # Adaptive splitting if batch payload is rejected as too large (413 or 400 payload error)
                 if status_code in (413, 400) and len(batch) > 1:
                     logger.warning(
-                        f"  [Embed] Batch {batch_idx+1} payload size rejected ({status_code}). "
-                        f"Splitting batch of {len(batch)} into 2 sub-batches..."
+                        f"  [Embed] OpenAI Batch {batch_idx+1} payload rejected ({status_code}). "
+                        f"Splitting batch of {len(batch)} in half..."
                     )
                     mid = len(batch) // 2
                     part1 = await self._embed_batch_with_retry(client, batch[:mid], batch_idx, total_batches, input_type)
@@ -185,13 +169,12 @@ class NVIDIAEmbeddingClient:
 
                 if attempt < max_retries - 1:
                     wait_time = None
-                    # Check for Retry-After header
                     retry_after_hdr = e.response.headers.get("Retry-After") or e.response.headers.get("retry-after")
                     if retry_after_hdr:
                         try:
-                            wait_time = float(retry_after_hdr) + 1.0
+                            wait_time = float(retry_after_hdr) + 0.5
                             logger.warning(
-                                f"  [Embed] Batch {batch_idx+1} server specified Retry-After: {retry_after_hdr}s. "
+                                f"  [Embed] OpenAI Batch {batch_idx+1} Retry-After specified: {retry_after_hdr}s. "
                                 f"Waiting {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})"
                             )
                         except ValueError:
@@ -199,22 +182,17 @@ class NVIDIAEmbeddingClient:
 
                     if wait_time is None:
                         if is_rate_limit:
-                            # Dynamically step up inter-request pacing delay to alleviate API gateway congestion
-                            self.min_delay = min(6.0, self.min_delay + 0.5)
-                            self.batch_size = max(5, self.batch_size - 5)
-                            logger.info(f"  [Embed] Dynamic Congestion Control: Increased pacing to {self.min_delay:.2f}s, reduced batch size to {self.batch_size}")
-                            # Jittered exponential backoff for rate limits: ~4s, ~9s, ~19s, ~37s, ~65s max
-                            base_backoff = min(65.0, (2 ** attempt) * 4.0)
-                            jitter = random.uniform(0.5, 2.0)
+                            base_backoff = min(30.0, (2 ** attempt) * 2.0)
+                            jitter = random.uniform(0.1, 1.0)
                             wait_time = base_backoff + jitter
                             logger.warning(
-                                f"  [Embed] Batch {batch_idx+1} quota/burst limited ({status_code}). "
+                                f"  [Embed] OpenAI Batch {batch_idx+1} rate limited ({status_code}). "
                                 f"Waiting {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})"
                             )
                         elif is_server_error:
-                            wait_time = 3.0 * (2 ** attempt) + random.uniform(0.1, 1.0)
+                            wait_time = 2.0 * (2 ** attempt) + random.uniform(0.1, 0.5)
                             logger.warning(
-                                f"  [Embed] Batch {batch_idx+1} server error ({status_code}). "
+                                f"  [Embed] OpenAI Batch {batch_idx+1} server error ({status_code}). "
                                 f"Retrying in {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})"
                             )
                         else:
@@ -223,22 +201,27 @@ class NVIDIAEmbeddingClient:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(
-                        f"  [Embed] Exhausted retries for batch {batch_idx+1}. "
+                        f"  [Embed] Exhausted retries for OpenAI batch {batch_idx+1}. "
                         f"Returning zero embeddings fallback."
                     )
-                    return [[0.0] * 2048 for _ in batch]
+                    return [[0.0] * self.vector_dim for _ in batch]
 
             except httpx.RequestError as e:
                 if attempt < max_retries - 1:
-                    wait_time = 3.0 * (2 ** attempt) + random.uniform(0.1, 1.0)
+                    wait_time = 2.0 * (2 ** attempt) + random.uniform(0.1, 0.5)
                     logger.warning(
-                        f"  [Embed] Batch {batch_idx+1} network error ({repr(e)}). "
+                        f"  [Embed] OpenAI Batch {batch_idx+1} network error ({repr(e)}). "
                         f"Retrying in {wait_time:.1f}s... (Attempt {attempt+1}/{max_retries})"
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"  [Embed] Network error exhausted for batch {batch_idx+1}. Fallback to zero vectors.")
-                    return [[0.0] * 2048 for _ in batch]
+                    logger.error(f"  [Embed] Network error exhausted for OpenAI batch {batch_idx+1}. Fallback to zero vectors.")
+                    return [[0.0] * self.vector_dim for _ in batch]
 
-        return [[0.0] * 2048 for _ in batch]
+        return [[0.0] * self.vector_dim for _ in batch]
+
+
+# Backwards compatibility alias
+NVIDIAEmbeddingClient = OpenAIEmbeddingClient
+
 

@@ -14,10 +14,11 @@ async def migrate():
         print("Enabling pgvector extension if not exists...")
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
 
-        print("Altering repo_chunks embedding column to halfvec(2048)...")
+        print("Altering repo_chunks embedding column to halfvec(1536)...")
         try:
-            await conn.execute(text("ALTER TABLE repo_chunks ALTER COLUMN embedding TYPE halfvec(2048);"))
-            print("Successfully migrated embedding to halfvec.")
+            await conn.execute(text("TRUNCATE TABLE repo_chunks;"))
+            await conn.execute(text("ALTER TABLE repo_chunks ALTER COLUMN embedding TYPE halfvec(1536);"))
+            print("Successfully migrated embedding to halfvec(1536).")
         except Exception as e:
             print(f"Migration error or already migrated (embedding): {e}")
 

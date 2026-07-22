@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,16 +12,18 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_raw_concurrency: int = 8
 
-    # ── NVIDIA NIM (used for both embeddings AND LLM) ────────
+    # ── OpenAI Embeddings ────────────────────────────────────
+    openai_api_key: str = ""
+    openai_embed_model: str = "text-embedding-3-small"
+    # Chunks per embedding request (OpenAI handles up to 2048 inputs per request)
+    embed_batch_size: int = 100
+    # RPM limit for OpenAI API (Tier 1 is 3,000+ RPM)
+    embed_rpm_limit: int = 3000
+    # Minimum delay between consecutive embedding requests
+    embed_min_delay_seconds: float = 0.05
+
+    # ── NVIDIA NIM (LLM Reasoning) ───────────────────────────
     nvidia_api_key: str = ""
-    # Embedding model (nemotron-3-embed-1b, 2048-dim vectors)
-    nvidia_embed_model: str = "nvidia/nemotron-3-embed-1b"
-    # Chunks per embedding request — 20 chunks (~4k tokens) balances RPM and TPM limits on NVIDIA free tier
-    embed_batch_size: int = 20
-    # RPM limit for NVIDIA API (free tier is 40)
-    embed_rpm_limit: int = 35
-    # Minimum delay between consecutive embedding requests to prevent burst/TPM rate limits
-    embed_min_delay_seconds: float = 2.00
     # LLM: nemotron-3-super-120b-a12b — 1M ctx, LatentMoE, reasoning mode, RAG-optimized
     repo_analizer_model: str = "nvidia/nemotron-3-super-120b-a12b"
     # Enable chain-of-thought reasoning on final synthesis pass (slower but more accurate)
@@ -29,7 +34,7 @@ class Settings(BaseSettings):
     
     # ── Smart File Selection ─────────────────────────────────
     smart_file_select_enabled: bool = True
-    smart_file_select_max_files: int = 50
+    smart_file_select_max_files: int = 100
 
     # ── Groq (Phase 3 group summaries) ──────────────────────
     groq_api_key: str = ""

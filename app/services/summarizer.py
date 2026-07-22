@@ -1309,6 +1309,7 @@ GitHub metadata:
 Now produce the complete RepoBrief with all evidenced fields populated accurately. Prefer "Not evidenced in the analyzed files" over unsupported guesses."""
 
         parser = PydanticOutputParser(pydantic_object=LLMRepoBrief)
+        format_instructions = parser.get_format_instructions()
         system_prompt += f"\n\n{format_instructions}\n\nCRITICAL FORMAT REQUIREMENT:\nYou MUST enclose your final JSON output inside a single markdown code block:\n```json\n{{\n  ...\n}}\n```\nDo NOT add any text outside the code block."
 
         print(f"  Calling NVIDIA reasoning LLM ({settings.repo_analizer_model}, thinking={settings.llm_enable_thinking})...")

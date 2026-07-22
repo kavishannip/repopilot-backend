@@ -38,7 +38,7 @@ class RepoChunk(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
     repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     chunk_text = Column(Text, nullable=False)
-    embedding = Column(HALFVEC(2048)) # Nvidia nemotron-3-embed-1b (storage optimized)
+    embedding = Column(HALFVEC(1536)) # OpenAI text-embedding-3-small (storage optimized)
     chunk_metadata = Column(JSONB)
 
     repository = relationship("Repository", back_populates="chunks")
