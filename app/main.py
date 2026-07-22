@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from .config import settings
 from app.api.endpoints import router as analyzer_router
+from app.api.chat_endpoints import router as chat_router
 
 app = FastAPI(
     title="RepoPilot API",
@@ -9,6 +10,7 @@ app = FastAPI(
 )
 
 app.include_router(analyzer_router, prefix="/api/analyzer", tags=["Analyzer"])
+app.include_router(chat_router, prefix="/api/chat", tags=["Chat"])
 
 @app.get("/")
 def read_root():
