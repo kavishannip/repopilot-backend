@@ -86,11 +86,18 @@ def _repair_json_string(json_str: str) -> str:
     return cleaned
 
 
+def _is_repobrief_candidate(data: Any) -> bool:
+    """Check if parsed JSON dictionary contains key RepoBrief schema fields."""
+    if not isinstance(data, dict):
+        return False
+    expected_keys = {"tech_stack", "architecture_summary", "summary", "components", "data_flow"}
+    return len(expected_keys.intersection(data.keys())) >= 2
+
+
 def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
     """
     Robust multi-strategy JSON extractor for LLM outputs.
-    Handles thinking CoT blocks (<think>...</think>), markdown code blocks,
-    non-greedy brace scanning, and minor JSON syntax repairs.
+    Prioritizes JSON candidates matching the RepoBrief schema to ignore small inline header dicts.
     """
     if isinstance(raw_content, list):
         parts = []
@@ -110,15 +117,22 @@ def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
     if not text_clean:
         text_clean = text
 
+    candidates: List[Dict[str, Any]] = []
+
     # 1. Check for markdown code blocks ```json ... ``` or ``` ... ```
     code_block_matches = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', text_clean, re.DOTALL)
     for block in code_block_matches:
         try:
-            return json.loads(block)
+            val = json.loads(block)
+            if _is_repobrief_candidate(val):
+                return val
+            candidates.append(val)
         except Exception:
-            repaired = _repair_json_string(block)
             try:
-                return json.loads(repaired)
+                val = json.loads(_repair_json_string(block))
+                if _is_repobrief_candidate(val):
+                    return val
+                candidates.append(val)
             except Exception:
                 continue
 
@@ -149,31 +163,31 @@ def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
                         end_idx = i
                         break
         if end_idx != -1:
-            candidate = text_clean[start_idx:end_idx + 1]
+            candidate_str = text_clean[start_idx:end_idx + 1]
             try:
-                return json.loads(candidate)
+                val = json.loads(candidate_str)
+                if _is_repobrief_candidate(val):
+                    return val
+                candidates.append(val)
             except Exception:
-                repaired = _repair_json_string(candidate)
                 try:
-                    return json.loads(repaired)
+                    val = json.loads(_repair_json_string(candidate_str))
+                    if _is_repobrief_candidate(val):
+                        return val
+                    candidates.append(val)
                 except Exception:
                     pass
         start_idx = text_clean.find('{', start_idx + 1)
 
-    # 3. Fallback greedy regex search
-    greedy_match = re.search(r'\{.*\}', text_clean, re.DOTALL)
-    if greedy_match:
-        candidate = greedy_match.group(0)
-        try:
-            return json.loads(candidate)
-        except Exception:
-            repaired = _repair_json_string(candidate)
-            try:
-                return json.loads(repaired)
-            except Exception as e:
-                raise ValueError(f"Failed to parse LLM JSON candidate: {e}")
+    # Fallback to any parsed candidate containing schema keys
+    for c in candidates:
+        if isinstance(c, dict) and any(k in c for k in ("tech_stack", "summary", "components", "architecture_summary")):
+            return c
 
-    raise ValueError("No valid JSON object found in LLM output")
+    if candidates:
+        return candidates[0]
+
+    raise ValueError("No valid RepoBrief JSON object found in LLM output")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,7 +651,7 @@ class RepoSummarizer:
         # ── Pass 3: Parallel file-group summaries (with caching) ──────
         await set_phase("group_summaries")
         t3 = time.time()
-        print("\n[Pass 3] Generating file-group summaries (NVIDIA NIM, map-reduce)...")
+        print(f"\n[Pass 3] Generating file-group summaries ({settings.groq_model}, map-reduce)...")
         group_summaries = await self._generate_group_summaries(
             structural_context, search_context, repo_url, commit_sha
         )

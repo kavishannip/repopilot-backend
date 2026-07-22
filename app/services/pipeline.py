@@ -184,7 +184,7 @@ class ProcessingPipeline:
         embeddings = []
         if all_chunks:
             texts = [c["text"] for c in all_chunks]
-            print(f"Embedding {len(texts)} chunks...")
+            print(f"Embedding {len(texts)} chunks (OpenAI text-embedding-3-small, 1536-dim)...")
             embeddings = await self.embedder.embed_chunks(texts, input_type="passage")
 
         # Save chunks and graph
