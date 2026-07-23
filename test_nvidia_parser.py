@@ -21,7 +21,7 @@ STRICT RULES:
 {format_instructions}
 """
 
-    user_prompt = """Repository: https://github.com/kbimsara/Z-ScoreUniFinder
+    user_prompt = """Repository: https://github.com/kavishannip/Ai-Diagrams
 Commit: 9dd068c0
 GitHub metadata:
   - Primary language: JavaScript
