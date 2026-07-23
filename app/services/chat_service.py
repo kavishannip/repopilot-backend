@@ -22,10 +22,10 @@ logger = logging.getLogger(__name__)
 
 class ChatAnswerResponse(BaseModel):
     answer: str = Field(
-        description="Detailed, accurate answer to the user's question based on the repository context."
+        description="Extremely concise, accurate, and direct answer to the user's question based strictly on the repository context. No filler."
     )
     sufficient: bool = Field(
-        description="True if the provided context is sufficient to answer accurately. False if key repository files or code are missing."
+        description="True ONLY if the provided context is completely sufficient to answer accurately with 100% precision. False if key repository files or code context are missing."
     )
 
 
@@ -160,7 +160,7 @@ class RepoChatService:
                     ]
 
                     if unprocessed_files:
-                        # 5c. Ask Fast LLM to pick up to 3 candidate files
+                        # 5c. Ask Fast LLM to pick up to 5 candidate files
                         candidate_files = await self._select_candidate_files(
                             unprocessed_files=unprocessed_files,
                             query=condensed_query,
@@ -221,7 +221,7 @@ class RepoChatService:
                             retrieved_chunks = await self.pipeline.search_chunks(
                                 query=condensed_query,
                                 repo_url=repo_url,
-                                top_k=8,
+                                top_k=10,
                             )
 
                             # 5f. Retry Answer Synthesis (Pass 2)
@@ -229,13 +229,15 @@ class RepoChatService:
                                 question=question,
                                 history=history,
                                 chunks=retrieved_chunks,
+                                is_fallback_pass=True,
                             )
                 except Exception as e:
                     logger.exception(f"[Chat] Fallback file scan encountered error: {e}")
 
-            # If still insufficient after fallback round, return honest notice
-            if not answer_res.sufficient and not answer_res.answer.strip():
-                answer_res.answer = "I don't have enough information in this repository to answer that question."
+            # If still insufficient after fallback round, return clear notice
+            if not answer_res.sufficient:
+                if not answer_res.answer.strip():
+                    answer_res.answer = "Information not found in the repository."
 
         # Save conversation to DB
         async with async_session() as session:
@@ -270,9 +272,11 @@ class RepoChatService:
         question: str,
         history: List[ChatMessage],
         chunks: List[Dict[str, Any]],
+        is_fallback_pass: bool = False,
     ) -> ChatAnswerResponse:
         """
         Synthesize final answer pass using Reasoning LLM with structured output.
+        Enforces strict brevity, anti-hallucination, and precision.
         """
         context_str = ""
         for i, c in enumerate(chunks, 1):
@@ -284,14 +288,15 @@ class RepoChatService:
             history_str = "\n".join(f"{m.role.capitalize()}: {m.content}" for m in history[-6:])
 
         prompt = (
-            "You are an expert AI code assistant answering questions about a codebase.\n"
-            "Analyze the retrieved code chunks and recent chat history to answer the user's question accurately and thoroughly.\n\n"
+            "You are a hyper-precise AI software engineer answering questions about a codebase.\n\n"
+            "STRICT RULES:\n"
+            "1. CONCISE & STRAIGHT TO THE POINT: Provide the SHORTEST possible accurate answer. Do NOT use conversational fluff (e.g., 'Based on the code...', 'Sure!', 'Here is...'). Answer with immediate factual precision or exact code snippets.\n"
+            "2. NO HALLUCINATION: Rely STRICTLY on the retrieved code chunks. Do NOT assume, invent, or guess details, parameters, or functions not explicitly present in the chunks.\n"
+            "3. HONESTY ABOUT MISSING CONTEXT: If the retrieved code chunks do NOT contain enough information to answer with 100% confidence, set `sufficient: false`.\n"
+            "4. IF NOT FOUND: If essential implementation details are not in the provided chunks, state concisely what is missing.\n\n"
             f"Recent Chat History:\n{history_str or 'None'}\n\n"
             f"Retrieved Code Chunks:\n{context_str or 'No relevant code chunks found.'}\n\n"
-            f"User Question: {question}\n\n"
-            "Instructions:\n"
-            "1. If the provided code chunks contain enough information to answer accurately, set `sufficient: true` and provide a detailed markdown answer.\n"
-            "2. If essential files or code context are missing and you cannot answer accurately, set `sufficient: false`.\n"
+            f"User Question: {question}"
         )
 
         reasoning_llm = get_reasoning_llm()
@@ -328,7 +333,6 @@ class RepoChatService:
             )
         except Exception as ex:
             logger.error(f"[Chat] Raw JSON fallback failed: {ex}")
-            # Final fallback
             return ChatAnswerResponse(
                 answer="Unable to parse answer response from reasoning model.",
                 sufficient=True,
@@ -340,20 +344,34 @@ class RepoChatService:
         query: str,
     ) -> List[str]:
         """
-        Ask Fast LLM to select up to 3 candidate file paths from unprocessed file tree.
+        Ask Fast LLM to select up to 5 candidate file paths from unprocessed file tree.
+        Filters out non-code binary assets first.
         """
         if not unprocessed_files:
             return []
 
-        # Cap file list sent to prompt to avoid context overflow
-        sample_files = unprocessed_files[:500]
+        # Filter out non-code binary/asset files
+        ignored_extensions = (
+            ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".woff", ".woff2",
+            ".ttf", ".eot", ".mp4", ".webm", ".zip", ".tar", ".gz", ".pdf",
+            ".exe", ".dll", ".so", ".dylib", ".lock", ".min.js", ".min.css", ".map"
+        )
+        code_files = [
+            f for f in unprocessed_files
+            if not f.lower().endswith(ignored_extensions)
+        ]
+
+        if not code_files:
+            return []
+
+        sample_files = code_files[:400]
 
         prompt = (
-            "You are a code retrieval system. Given a list of repository file paths and a search query, "
-            "select up to 3 candidate file paths that are most likely to contain the code needed to answer the query.\n\n"
+            "You are a repository file selection agent. Given a list of repository file paths and a search query, "
+            "select up to 5 candidate file paths that are most likely to contain the implementation or answer for the query.\n\n"
             f"Search Query: {query}\n\n"
             f"Available File Paths:\n" + "\n".join(sample_files) + "\n\n"
-            "Return ONLY a JSON array of up to 3 file paths, e.g. [\"src/auth.py\", \"config/settings.py\"]. "
+            "Return ONLY a JSON array of up to 5 file paths, e.g. [\"src/auth.py\", \"config/settings.py\"]. "
             "If no files look relevant, return []."
         )
 
@@ -371,8 +389,9 @@ class RepoChatService:
             candidates = json.loads(content)
             if isinstance(candidates, list):
                 valid = [p for p in candidates if isinstance(p, str) and p in unprocessed_files]
-                return valid[:3]
+                return valid[:5]
         except Exception as e:
             logger.warning(f"[Chat] Candidate file selection failed: {e}")
 
         return []
+
