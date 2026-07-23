@@ -21,3 +21,6 @@ ENV/
 
 # Scripts
 scripts/delete_repo.py
+
+# Documentation / Guides
+POSTMAN_API_GUIDE.md
