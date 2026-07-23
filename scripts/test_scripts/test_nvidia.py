@@ -1,5 +1,10 @@
 import asyncio
 import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from pydantic import BaseModel, Field
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from app.config import settings
@@ -7,7 +12,6 @@ from app.models.brief import LLMRepoBrief
 
 async def test_llm():
     print("Model:", settings.repo_analizer_model)
-    # Just a mini test
     llm = ChatNVIDIA(
         api_key=settings.nvidia_api_key,
         model=settings.repo_analizer_model,

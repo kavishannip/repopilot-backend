@@ -1,4 +1,10 @@
 import asyncio
+import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from app.config import settings
 from app.models.brief import LLMRepoBrief
@@ -9,6 +15,7 @@ async def test_llm():
 Your task: produce a HIGHLY ACCURATE RepoBrief that could let someone draw an architecture diagram.
 
 STRICT RULES:
+- STRICT ANTI-HALLUCINATION RULE: You must ONLY use information explicitly present in the provided context. If the context does not contain enough information to accurately populate a field, you MUST output 'Not available' (for strings) or an empty list/object (for arrays/dicts). Do NOT guess, infer, or fabricate any details, names, or versions.
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
 """
 

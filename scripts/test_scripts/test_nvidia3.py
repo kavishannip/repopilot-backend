@@ -1,6 +1,13 @@
 import asyncio
+import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from app.config import settings
+from app.models.brief import LLMRepoBrief
 from langchain_core.messages import SystemMessage, HumanMessage
 
 async def test_llm():
@@ -34,12 +41,14 @@ There is a frontend in Next.js and backend in FastAPI.
         temperature=0.0,
     ).with_thinking_mode(enabled=True)
     
+    llm_structured = llm.with_structured_output(LLMRepoBrief)
+    
     try:
-        res = await llm.ainvoke([
+        res = await llm_structured.ainvoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
         ])
-        print("RAW CONTENT:", res.content)
+        print(res.model_dump_json(indent=2))
     except Exception as e:
         print("ERROR:", e)
 

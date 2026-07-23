@@ -3,7 +3,7 @@ import os
 import sys
 
 # Ensure the root directory is in python path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from app.database import engine
 from app.models.schema import Base
