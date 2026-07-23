@@ -1,7 +1,12 @@
 import asyncio
+import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from app.config import settings
-from app.models.brief import LLMRepoBrief
 from langchain_core.messages import SystemMessage, HumanMessage
 
 async def test_llm():
@@ -12,7 +17,7 @@ STRICT RULES:
 - ALL fields REQUIRED with substantive content. Empty lists unacceptable when evidence exists.
 """
 
-    user_prompt = """Repository: https://github.com/kbimsara/Z-ScoreUniFinder
+    user_prompt = """Repository: https://github.com/kavishannip/Ai-Diagrams
 Commit: 9dd068c0
 GitHub metadata:
   - Primary language: JavaScript
@@ -35,14 +40,12 @@ There is a frontend in Next.js and backend in FastAPI.
         temperature=0.0,
     ).with_thinking_mode(enabled=True)
     
-    llm_structured = llm.with_structured_output(LLMRepoBrief)
-    
     try:
-        res = await llm_structured.ainvoke([
+        res = await llm.ainvoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
         ])
-        print(res.model_dump_json(indent=2))
+        print("RAW CONTENT:", res.content)
     except Exception as e:
         print("ERROR:", e)
 

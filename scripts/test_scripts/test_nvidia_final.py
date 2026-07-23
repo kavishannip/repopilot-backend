@@ -1,4 +1,10 @@
 import asyncio
+import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from app.config import settings
 from app.models.brief import LLMRepoBrief
@@ -15,7 +21,7 @@ STRICT RULES:
 - NO MARKDOWN REPORTS: You must return the results SOLELY by populating the provided JSON/function schema. Do NOT write a markdown report or table. ALL information must be placed inside the schema fields.
 """
 
-    user_prompt = """Repository: https://github.com/kbimsara/Z-ScoreUniFinder
+    user_prompt = """Repository: https://github.com/kavishannip/Ai-Diagrams
 Commit: 9dd068c0
 GitHub metadata:
   - Primary language: JavaScript

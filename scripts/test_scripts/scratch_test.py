@@ -1,4 +1,10 @@
 import asyncio
+import os
+import sys
+
+# Ensure the root directory is in python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from app.services.github_client import GitHubClient
 from app.services.structural_scanner import StructuralScanner
 import uuid
@@ -42,4 +48,5 @@ async def main():
     else:
         print("NO EDGES FOUND!")
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

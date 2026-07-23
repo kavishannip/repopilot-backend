@@ -350,6 +350,35 @@ class GitHubClient:
             raise RateLimitExceededError("GitHub API rate limit exceeded.")
         response.raise_for_status()
 
+    async def get_commit_diff(self, repo_url: str, base_sha: str, head_sha: str) -> Dict[str, List[str]]:
+        """
+        Compare two commits via GitHub API.
+        Returns dict with file lists: {"added": [...], "modified": [...], "removed": [...]}
+        """
+        owner, repo = self._parse_repo_url(repo_url)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            resp = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+                headers=self.headers
+            )
+            self._handle_rate_limit(resp)
+            data = resp.json()
+            
+            diff = {"added": [], "modified": [], "removed": []}
+            files = data.get("files", [])
+            for f in files:
+                status = f.get("status")
+                path = f.get("filename")
+                if not path or self._is_noise(path):
+                    continue
+                if status == "added":
+                    diff["added"].append(path)
+                elif status in ("modified", "renamed", "changed"):
+                    diff["modified"].append(path)
+                elif status in ("removed", "deleted"):
+                    diff["removed"].append(path)
+            return diff
+
     async def get_repo_metadata(self, repo_url: str) -> Dict[str, Any]:
         owner, repo = self._parse_repo_url(repo_url)
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
