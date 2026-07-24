@@ -19,40 +19,49 @@ class ComponentInfo(BaseModel):
 class TechItem(BaseModel):
     name: str = Field(description="Technology name, e.g. 'React', 'FastAPI', 'PostgreSQL'")
     version: Optional[str] = Field(default=None, description="Version if detected, e.g. '18.x', '0.115.0'")
-    category: str = Field(description="Category: 'framework', 'library', 'database', 'language', 'tool', 'platform'")
-    purpose: str = Field(description="What role this technology plays in the project")
+    category: str = Field(default="tool", description="Category: 'framework', 'library', 'database', 'language', 'tool', 'platform'")
+    purpose: str = Field(default="Detected technology role in project", description="What role this technology plays in the project")
 
 
 class LLMRepoBrief(BaseModel):
     # Core fields
     tech_stack: List[TechItem] = Field(
+        default_factory=list,
         description="List of main technologies with versions and categories"
     )
     architecture_summary: str = Field(
+        default="Architecture overview not available.",
         description="Detailed description of overall architecture, how components interact, request/data flow"
     )
     entry_points: List[FileReference] = Field(
+        default_factory=list,
         description="Key files that serve as entry points: main files, route files, API handlers, core configs"
     )
     flagged_issues: List[str] = Field(
+        default_factory=list,
         description="Potential issues, missing documentation, technical debt, or security concerns"
     )
     summary: str = Field(
+        default="Repository summary not available.",
         description="High-level 2-3 paragraph summary: what the repo does, who it's for, key capabilities"
     )
 
     # Architectural detail
     components: List[ComponentInfo] = Field(
+        default_factory=list,
         description="Architectural components breakdown (frontend, backend, DB layer, etc.)"
     )
     data_flow: str = Field(
+        default="Data flow description not available.",
         description="How data flows through the system: user request → ... → response. Include key transformation steps."
     )
     detected_patterns: List[str] = Field(
+        default_factory=list,
         description="Architectural/design patterns detected: e.g. 'MVC', 'REST API', 'PWA', 'Server-Side Rendering', 'Event-driven', 'Monorepo'"
     )
 
     dependency_graph: Dict[str, List[str]] = Field(
+        default_factory=dict,
         description="Component dependency map: {'frontend': ['backend_api', 'auth'], 'backend_api': ['database', 'cache']}"
     )
 

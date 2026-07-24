@@ -86,12 +86,106 @@ def _repair_json_string(json_str: str) -> str:
     return cleaned
 
 
-def _is_repobrief_candidate(data: Any) -> bool:
-    """Check if parsed JSON dictionary contains key RepoBrief schema fields."""
+def _score_repobrief_candidate(data: Any) -> int:
+    """Score JSON object by count of RepoBrief schema keys present."""
     if not isinstance(data, dict):
-        return False
-    expected_keys = {"tech_stack", "architecture_summary", "summary", "components", "data_flow"}
-    return len(expected_keys.intersection(data.keys())) >= 2
+        return 0
+    expected_keys = {
+        "tech_stack", "architecture_summary", "summary", "components",
+        "data_flow", "entry_points", "flagged_issues", "dependency_graph", "detected_patterns"
+    }
+    return len(expected_keys.intersection(data.keys()))
+
+
+def _normalize_llm_payload(data: Any) -> Dict[str, Any]:
+    """Coerce and normalize raw LLM JSON dict into Pydantic-compliant RepoBrief dict."""
+    if not isinstance(data, dict):
+        return {}
+
+    normalized = dict(data)
+
+    # 1. Normalize tech_stack
+    tech_stack_raw = normalized.get("tech_stack")
+    normalized_tech = []
+    if isinstance(tech_stack_raw, dict):
+        for k, v in tech_stack_raw.items():
+            ver = str(v) if v and not isinstance(v, list) else None
+            normalized_tech.append({"name": str(k), "version": ver, "category": "tool", "purpose": "Detected technology"})
+    elif isinstance(tech_stack_raw, list):
+        for item in tech_stack_raw:
+            if isinstance(item, str):
+                normalized_tech.append({"name": item, "version": None, "category": "tool", "purpose": "Detected technology"})
+            elif isinstance(item, dict):
+                name = item.get("name") or "Unknown"
+                ver = item.get("version")
+                cat = item.get("category") or "tool"
+                purp = item.get("purpose") or "Detected technology"
+                normalized_tech.append({"name": str(name), "version": str(ver) if ver else None, "category": str(cat), "purpose": str(purp)})
+    normalized["tech_stack"] = normalized_tech
+
+    # 2. Normalize components
+    comp_raw = normalized.get("components")
+    normalized_comp = []
+    if isinstance(comp_raw, list):
+        for item in comp_raw:
+            if isinstance(item, dict):
+                normalized_comp.append({
+                    "name": str(item.get("name") or "component"),
+                    "directory": str(item.get("directory") or item.get("name") or "/"),
+                    "description": str(item.get("description") or "Component description"),
+                    "key_files": [str(x) for x in item.get("key_files", [])] if isinstance(item.get("key_files"), list) else [],
+                    "depends_on": [str(x) for x in item.get("depends_on", [])] if isinstance(item.get("depends_on"), list) else [],
+                    "technologies": [str(x) for x in item.get("technologies", [])] if isinstance(item.get("technologies"), list) else [],
+                })
+    elif isinstance(comp_raw, dict):
+        for k, v in comp_raw.items():
+            deps = [str(x) for x in v] if isinstance(v, list) else []
+            normalized_comp.append({
+                "name": str(k),
+                "directory": str(k),
+                "description": f"Component {k}",
+                "key_files": [],
+                "depends_on": deps,
+                "technologies": [],
+            })
+    normalized["components"] = normalized_comp
+
+    # 3. Normalize entry_points
+    ep_raw = normalized.get("entry_points")
+    normalized_ep = []
+    if isinstance(ep_raw, list):
+        for item in ep_raw:
+            if isinstance(item, str):
+                normalized_ep.append({"file_path": item, "description": "Entry point file"})
+            elif isinstance(item, dict):
+                file_path = item.get("file_path") or item.get("path") or item.get("file") or "unknown"
+                desc = item.get("description") or "Entry point file"
+                normalized_ep.append({"file_path": str(file_path), "description": str(desc)})
+    normalized["entry_points"] = normalized_ep
+
+    # 4. Normalize string fields
+    for field in ("architecture_summary", "summary", "data_flow"):
+        if not isinstance(normalized.get(field), str) or not normalized.get(field):
+            normalized[field] = f"{field.replace('_', ' ').title()} not provided."
+
+    # 5. Normalize lists
+    for list_field in ("flagged_issues", "detected_patterns"):
+        if not isinstance(normalized.get(list_field), list):
+            normalized[list_field] = []
+        else:
+            normalized[list_field] = [str(x) for x in normalized[list_field]]
+
+    # 6. Normalize dependency_graph
+    dep_graph_raw = normalized.get("dependency_graph")
+    if not isinstance(dep_graph_raw, dict):
+        normalized["dependency_graph"] = {}
+    else:
+        norm_dep = {}
+        for k, v in dep_graph_raw.items():
+            norm_dep[str(k)] = [str(x) for x in v] if isinstance(v, list) else []
+        normalized["dependency_graph"] = norm_dep
+
+    return normalized
 
 
 def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
@@ -124,14 +218,10 @@ def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
     for block in code_block_matches:
         try:
             val = json.loads(block)
-            if _is_repobrief_candidate(val):
-                return val
             candidates.append(val)
         except Exception:
             try:
                 val = json.loads(_repair_json_string(block))
-                if _is_repobrief_candidate(val):
-                    return val
                 candidates.append(val)
             except Exception:
                 continue
@@ -166,28 +256,21 @@ def _extract_json_payload(raw_content: Any) -> Dict[str, Any]:
             candidate_str = text_clean[start_idx:end_idx + 1]
             try:
                 val = json.loads(candidate_str)
-                if _is_repobrief_candidate(val):
-                    return val
                 candidates.append(val)
             except Exception:
                 try:
                     val = json.loads(_repair_json_string(candidate_str))
-                    if _is_repobrief_candidate(val):
-                        return val
                     candidates.append(val)
                 except Exception:
                     pass
         start_idx = text_clean.find('{', start_idx + 1)
 
-    # Fallback to any parsed candidate containing schema keys
-    for c in candidates:
-        if isinstance(c, dict) and any(k in c for k in ("tech_stack", "summary", "components", "architecture_summary")):
-            return c
+    if not candidates:
+        raise ValueError("No valid RepoBrief JSON object found in LLM output")
 
-    if candidates:
-        return candidates[0]
-
-    raise ValueError("No valid RepoBrief JSON object found in LLM output")
+    # Pick candidate with highest score (most RepoBrief schema keys matched)
+    best_candidate = max(candidates, key=_score_repobrief_candidate)
+    return _normalize_llm_payload(best_candidate)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

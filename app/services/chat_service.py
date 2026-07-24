@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
@@ -318,19 +319,12 @@ class RepoChatService:
         try:
             raw_res = await reasoning_llm.ainvoke(json_prompt)
             content = raw_res.content if hasattr(raw_res, "content") else str(raw_res)
-            
-            # Clean markdown code blocks if present
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            parsed = json.loads(content)
-            return ChatAnswerResponse(
-                answer=parsed.get("answer", content),
-                sufficient=bool(parsed.get("sufficient", True)),
-            )
+            parsed = _extract_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return ChatAnswerResponse(
+                    answer=parsed.get("answer", content),
+                    sufficient=bool(parsed.get("sufficient", True)),
+                )
         except Exception as ex:
             logger.error(f"[Chat] Raw JSON fallback failed: {ex}")
             return ChatAnswerResponse(
@@ -380,13 +374,17 @@ class RepoChatService:
             res = await fast_llm.ainvoke(prompt)
             content = res.content if hasattr(res, "content") else str(res)
 
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
+            try:
+                candidates = _extract_json_from_llm(content)
+            except Exception:
+                # Fallback: scan for line-by-line file path matches in output text
+                candidates = []
+                cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                for line in cleaned.splitlines():
+                    line_clean = line.strip().strip("-*`\"'").strip()
+                    if line_clean in unprocessed_files:
+                        candidates.append(line_clean)
 
-            candidates = json.loads(content)
             if isinstance(candidates, list):
                 valid = [p for p in candidates if isinstance(p, str) and p in unprocessed_files]
                 return valid[:5]
@@ -394,4 +392,51 @@ class RepoChatService:
             logger.warning(f"[Chat] Candidate file selection failed: {e}")
 
         return []
+
+
+def _extract_json_from_llm(content: str) -> Any:
+    """
+    Robustly extract and parse JSON (dict or list) from LLM output.
+    Handles thinking tags (<think>...</think>), markdown code blocks, preambles, and raw JSON.
+    """
+    if not content:
+        raise ValueError("LLM output is empty.")
+
+    # 1. Strip reasoning/thinking tags (e.g. <think>...</think>)
+    cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    if not cleaned:
+        cleaned = content.strip()
+
+    # 2. Try markdown code block extraction ```json ... ``` or ``` ... ```
+    code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', cleaned)
+    if code_block_match:
+        block_content = code_block_match.group(1).strip()
+        try:
+            return json.loads(block_content)
+        except Exception:
+            pass
+
+    # 3. Try parsing the cleaned text directly
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 4. Search for outer JSON array [...] or outer JSON object {...}
+    array_match = re.search(r'(\[\s*[\s\S]*?\s*\])', cleaned)
+    if array_match:
+        try:
+            return json.loads(array_match.group(1))
+        except Exception:
+            pass
+
+    object_match = re.search(r'(\{\s*[\s\S]*?\s*\})', cleaned)
+    if object_match:
+        try:
+            return json.loads(object_match.group(1))
+        except Exception:
+            pass
+
+    raise ValueError(f"No valid JSON array or object found in LLM response: {content[:100]!r}")
+
 

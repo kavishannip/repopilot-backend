@@ -30,7 +30,8 @@ class CreateSessionResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     session_id: str
-    question: str
+    question: Optional[str] = None
+    message: Optional[str] = None
     client_id: Optional[str] = None
 
 
@@ -115,12 +116,15 @@ async def send_chat_message(
     Runs query condensation, vector search, reasoning LLM synthesis, and 1-pass fallback file scan if needed.
     """
     effective_client_id = get_effective_client_id(x_client_id, req.client_id)
+    user_query = req.question or req.message
+    if not user_query:
+        raise HTTPException(status_code=400, detail="Field 'question' or 'message' is required.")
 
     try:
         res = await chat_service.generate_chat_response(
             session_id=req.session_id,
             user_id=effective_client_id,
-            question=req.question,
+            question=user_query,
         )
         return SendMessageResponse(**res)
     except ValueError as e:
