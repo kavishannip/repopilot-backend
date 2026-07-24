@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 class ChatAnswerResponse(BaseModel):
     answer: str = Field(
-        description="Extremely concise, accurate, and direct answer to the user's question based strictly on the repository context. No filler."
+        description=(
+            "Extremely concise, accurate, and direct answer to the user's question based strictly on the repository context. "
+            "When explaining logic or asked for code, include exact verbatim code snippets from the context formatted in standard markdown code blocks "
+            "with language and filepath (e.g. ```python:app/main.py or ```python with // File: app/main.py). Never invent or hallucinate code."
+        )
     )
     sufficient: bool = Field(
         description="True ONLY if the provided context is completely sufficient to answer accurately with 100% precision. False if key repository files or code context are missing."
@@ -291,10 +295,20 @@ class RepoChatService:
         prompt = (
             "You are a hyper-precise AI software engineer answering questions about a codebase.\n\n"
             "STRICT RULES:\n"
-            "1. CONCISE & STRAIGHT TO THE POINT: Provide the SHORTEST possible accurate answer. Do NOT use conversational fluff (e.g., 'Based on the code...', 'Sure!', 'Here is...'). Answer with immediate factual precision or exact code snippets.\n"
-            "2. NO HALLUCINATION: Rely STRICTLY on the retrieved code chunks. Do NOT assume, invent, or guess details, parameters, or functions not explicitly present in the chunks.\n"
-            "3. HONESTY ABOUT MISSING CONTEXT: If the retrieved code chunks do NOT contain enough information to answer with 100% confidence, set `sufficient: false`.\n"
-            "4. IF NOT FOUND: If essential implementation details are not in the provided chunks, state concisely what is missing.\n\n"
+            "1. CONCISE & STRAIGHT TO THE POINT: Provide the SHORTEST possible accurate answer. Do NOT use conversational fluff (e.g., 'Based on the code...', 'Sure!', 'Here is...'). Answer with immediate factual precision.\n"
+            "2. VERBATIM CODE SNIPPETS: When explaining code logic, architecture, functions, or when requested by the user, ALWAYS include actual code snippets from the provided retrieved chunks.\n"
+            "3. NO HALLUCINATION OF CODE: Only provide code examples that are EXACT, VERBATIM snippets from the actual repository code context provided. NEVER invent, rewrite, or hallucinate new code, functions, or parameters not present in the chunks.\n"
+            "4. MANDATORY CODE FORMAT: Format every code snippet strictly using standard markdown code blocks specifying the language and exact relative file path. Format as either:\n"
+            "   ```<language>:<filepath>\n"
+            "   <exact code snippet from context>\n"
+            "   ```\n"
+            "   or\n"
+            "   ```<language>\n"
+            "   // File: <filepath>\n"
+            "   <exact code snippet from context>\n"
+            "   ```\n"
+            "5. HONESTY ABOUT MISSING CONTEXT: If the retrieved code chunks do NOT contain enough information to answer with 100% confidence, set `sufficient: false`.\n"
+            "6. IF NOT FOUND: If essential implementation details or requested code snippets are not in the provided chunks, state concisely what is missing.\n\n"
             f"Recent Chat History:\n{history_str or 'None'}\n\n"
             f"Retrieved Code Chunks:\n{context_str or 'No relevant code chunks found.'}\n\n"
             f"User Question: {question}"
