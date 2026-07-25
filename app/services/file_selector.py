@@ -37,7 +37,7 @@ ARCH_DIRS = {
 ARCH_NAMES = {
     "schema", "model", "store", "context", "pipeline", "handler",
     "router", "registry", "factory", "manager", "dispatcher", "processor",
-    "config", "settings", "constants", "types", "interfaces", "base",
+    "config", "settings", "constants", "types", "interfaces", "base", "env",
 }
 
 # Filename substrings that deprioritize (test / mock / generated)

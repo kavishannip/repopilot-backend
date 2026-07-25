@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
@@ -22,7 +23,11 @@ logger = logging.getLogger(__name__)
 
 class ChatAnswerResponse(BaseModel):
     answer: str = Field(
-        description="Extremely concise, accurate, and direct answer to the user's question based strictly on the repository context. No filler."
+        description=(
+            "Extremely concise, accurate, and direct answer to the user's question based strictly on the repository context. "
+            "When explaining logic or asked for code, include exact verbatim code snippets from the context formatted in standard markdown code blocks "
+            "with language and filepath (e.g. ```python:app/main.py or ```python with // File: app/main.py). Never invent or hallucinate code."
+        )
     )
     sufficient: bool = Field(
         description="True ONLY if the provided context is completely sufficient to answer accurately with 100% precision. False if key repository files or code context are missing."
@@ -290,10 +295,20 @@ class RepoChatService:
         prompt = (
             "You are a hyper-precise AI software engineer answering questions about a codebase.\n\n"
             "STRICT RULES:\n"
-            "1. CONCISE & STRAIGHT TO THE POINT: Provide the SHORTEST possible accurate answer. Do NOT use conversational fluff (e.g., 'Based on the code...', 'Sure!', 'Here is...'). Answer with immediate factual precision or exact code snippets.\n"
-            "2. NO HALLUCINATION: Rely STRICTLY on the retrieved code chunks. Do NOT assume, invent, or guess details, parameters, or functions not explicitly present in the chunks.\n"
-            "3. HONESTY ABOUT MISSING CONTEXT: If the retrieved code chunks do NOT contain enough information to answer with 100% confidence, set `sufficient: false`.\n"
-            "4. IF NOT FOUND: If essential implementation details are not in the provided chunks, state concisely what is missing.\n\n"
+            "1. CONCISE & STRAIGHT TO THE POINT: Provide the SHORTEST possible accurate answer. Do NOT use conversational fluff (e.g., 'Based on the code...', 'Sure!', 'Here is...'). Answer with immediate factual precision.\n"
+            "2. VERBATIM CODE SNIPPETS: When explaining code logic, architecture, functions, or when requested by the user, ALWAYS include actual code snippets from the provided retrieved chunks.\n"
+            "3. NO HALLUCINATION OF CODE: Only provide code examples that are EXACT, VERBATIM snippets from the actual repository code context provided. NEVER invent, rewrite, or hallucinate new code, functions, or parameters not present in the chunks.\n"
+            "4. MANDATORY CODE FORMAT: Format every code snippet strictly using standard markdown code blocks specifying the language and exact relative file path. Format as either:\n"
+            "   ```<language>:<filepath>\n"
+            "   <exact code snippet from context>\n"
+            "   ```\n"
+            "   or\n"
+            "   ```<language>\n"
+            "   // File: <filepath>\n"
+            "   <exact code snippet from context>\n"
+            "   ```\n"
+            "5. HONESTY ABOUT MISSING CONTEXT: If the retrieved code chunks do NOT contain enough information to answer with 100% confidence, set `sufficient: false`.\n"
+            "6. IF NOT FOUND: If essential implementation details or requested code snippets are not in the provided chunks, state concisely what is missing.\n\n"
             f"Recent Chat History:\n{history_str or 'None'}\n\n"
             f"Retrieved Code Chunks:\n{context_str or 'No relevant code chunks found.'}\n\n"
             f"User Question: {question}"
@@ -318,19 +333,12 @@ class RepoChatService:
         try:
             raw_res = await reasoning_llm.ainvoke(json_prompt)
             content = raw_res.content if hasattr(raw_res, "content") else str(raw_res)
-            
-            # Clean markdown code blocks if present
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
-
-            parsed = json.loads(content)
-            return ChatAnswerResponse(
-                answer=parsed.get("answer", content),
-                sufficient=bool(parsed.get("sufficient", True)),
-            )
+            parsed = _extract_json_from_llm(content)
+            if isinstance(parsed, dict):
+                return ChatAnswerResponse(
+                    answer=parsed.get("answer", content),
+                    sufficient=bool(parsed.get("sufficient", True)),
+                )
         except Exception as ex:
             logger.error(f"[Chat] Raw JSON fallback failed: {ex}")
             return ChatAnswerResponse(
@@ -380,13 +388,17 @@ class RepoChatService:
             res = await fast_llm.ainvoke(prompt)
             content = res.content if hasattr(res, "content") else str(res)
 
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
+            try:
+                candidates = _extract_json_from_llm(content)
+            except Exception:
+                # Fallback: scan for line-by-line file path matches in output text
+                candidates = []
+                cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+                for line in cleaned.splitlines():
+                    line_clean = line.strip().strip("-*`\"'").strip()
+                    if line_clean in unprocessed_files:
+                        candidates.append(line_clean)
 
-            candidates = json.loads(content)
             if isinstance(candidates, list):
                 valid = [p for p in candidates if isinstance(p, str) and p in unprocessed_files]
                 return valid[:5]
@@ -394,4 +406,51 @@ class RepoChatService:
             logger.warning(f"[Chat] Candidate file selection failed: {e}")
 
         return []
+
+
+def _extract_json_from_llm(content: str) -> Any:
+    """
+    Robustly extract and parse JSON (dict or list) from LLM output.
+    Handles thinking tags (<think>...</think>), markdown code blocks, preambles, and raw JSON.
+    """
+    if not content:
+        raise ValueError("LLM output is empty.")
+
+    # 1. Strip reasoning/thinking tags (e.g. <think>...</think>)
+    cleaned = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+    if not cleaned:
+        cleaned = content.strip()
+
+    # 2. Try markdown code block extraction ```json ... ``` or ``` ... ```
+    code_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', cleaned)
+    if code_block_match:
+        block_content = code_block_match.group(1).strip()
+        try:
+            return json.loads(block_content)
+        except Exception:
+            pass
+
+    # 3. Try parsing the cleaned text directly
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 4. Search for outer JSON array [...] or outer JSON object {...}
+    array_match = re.search(r'(\[\s*[\s\S]*?\s*\])', cleaned)
+    if array_match:
+        try:
+            return json.loads(array_match.group(1))
+        except Exception:
+            pass
+
+    object_match = re.search(r'(\{\s*[\s\S]*?\s*\})', cleaned)
+    if object_match:
+        try:
+            return json.loads(object_match.group(1))
+        except Exception:
+            pass
+
+    raise ValueError(f"No valid JSON array or object found in LLM response: {content[:100]!r}")
+
 

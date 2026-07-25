@@ -27,8 +27,11 @@ class QuickSummaryRequest(BaseModel):
 
 class QuickSummaryResponse(BaseModel):
     repo_id: str
+    repo_url: str
     summary: str
     metadata: dict
+    cached: bool = False
+    cached_brief: Optional[RepoBrief] = None
 
 
 class AnalyzeResponse(BaseModel):
@@ -58,12 +61,16 @@ class GraphNodeResponse(BaseModel):
     path: str
     type: str
     deep_analysis: bool
+    data: Optional[dict] = None
 
 class GraphEdgeResponse(BaseModel):
     id: str
-    source_node_id: str
-    target_node_id: str
+    source: str
+    target: str
+    source_node_id: Optional[str] = None
+    target_node_id: Optional[str] = None
     type: str
+    label: Optional[str] = None
 
 class GraphDataResponse(BaseModel):
     nodes: List[GraphNodeResponse]
@@ -125,10 +132,20 @@ async def get_quick_summary(req: QuickSummaryRequest):
 
         if repo_obj and repo_obj.quick_summary:
             # Cache hit
+            cached_brief_obj = None
+            if repo_obj.brief:
+                try:
+                    cached_brief_obj = RepoBrief(**repo_obj.brief)
+                except Exception:
+                    cached_brief_obj = None
+
             return QuickSummaryResponse(
                 repo_id=str(repo_obj.id),
+                repo_url=repo_url,
                 summary=repo_obj.quick_summary,
-                metadata=meta
+                metadata=meta,
+                cached=True,
+                cached_brief=cached_brief_obj
             )
 
     # Generate summary
@@ -165,8 +182,10 @@ async def get_quick_summary(req: QuickSummaryRequest):
 
     return QuickSummaryResponse(
         repo_id=repo_id_str,
+        repo_url=repo_url,
         summary=summary_text,
-        metadata=meta
+        metadata=meta,
+        cached=False
     )
 
 
@@ -306,15 +325,24 @@ async def get_graph_data(repo_url: str):
                 id=str(n.id), 
                 path=n.path, 
                 type=n.type, 
-                deep_analysis=n.deep_analysis
+                deep_analysis=n.deep_analysis,
+                data={
+                    "label": n.path.split("/")[-1] if n.path else str(n.id),
+                    "path": n.path,
+                    "type": n.type,
+                    "deep_analysis": n.deep_analysis
+                }
             ) for n in nodes
         ],
         edges=[
             GraphEdgeResponse(
                 id=str(e.id), 
+                source=str(e.source_node_id),
+                target=str(e.target_node_id),
                 source_node_id=str(e.source_node_id), 
                 target_node_id=str(e.target_node_id), 
-                type=e.type
+                type=e.type,
+                label=e.type
             ) for e in edges
         ]
     )
