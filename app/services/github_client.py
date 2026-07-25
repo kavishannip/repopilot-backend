@@ -113,7 +113,7 @@ CRITICAL_FILES = {
     "Gemfile", "go.mod", "go.sum", "pubspec.yaml", "mix.exs",
     "Dockerfile", "docker-compose.yml", "docker-compose.yaml", "docker-compose.override.yml",
     "Makefile", "justfile", "Taskfile.yml",
-    ".env.example", ".env.sample", ".env.template",
+    ".env", ".env.*", ".env-*", ".env.example", ".env.sample", ".env.template", ".env.local", ".env.development", ".env.test", ".env.staging", ".env.production",
     # More language/ecosystem manifests
     "build.sbt", "project.clj", "deps.edn", "rebar.config", "dune-project", "dune",
     "CMakeLists.txt", "meson.build", "BUILD.bazel", "WORKSPACE", "WORKSPACE.bazel",
@@ -722,7 +722,7 @@ class GitHubClient:
         manifest_patterns = [
             "README*", "package.json", "requirements.txt", "pyproject.toml",
             "Cargo.toml", "pom.xml", "go.mod", "Gemfile",
-            "Dockerfile", "docker-compose*", "Makefile",
+            "Dockerfile", "docker-compose*", "Makefile", ".env*",
         ]
         entry_patterns = ["main.*", "app.*", "index.*", "server.*", "manage.py", "wsgi.py", "asgi.py"]
         config_patterns = ["tsconfig*", "next.config*", "vite.config*", "tailwind.config*", "*.config.*"]
