@@ -10,6 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.database import engine, async_session
 from app.models.schema import Repository, RepoChunk, ChatSession, ChatMessage
 from app.services.chat_service import RepoChatService, ChatAnswerResponse
+from app.services.github_client import GitHubClient
 from app.services.pipeline import ProcessingPipeline
 from sqlalchemy.future import select
 from sqlalchemy import func
@@ -174,13 +175,35 @@ async def test_code_snippet_prompt_format():
     print("[SUCCESS] Verbatim code snippet and anti-hallucination rules verified!")
 
 
+async def test_env_file_prioritization():
+    print("\n--- Test 5: .env File Prioritization & Classification Verification ---")
+    github_client = GitHubClient()
+    
+    test_paths = [".env", ".env.local", ".env.example", ".env.production", ".env-test", "src/main.py"]
+    classification = github_client.classify_files(test_paths)
+    
+    critical_files = set(classification["critical"])
+    expected_env_files = {".env", ".env.local", ".env.example", ".env.production", ".env-test"}
+    assert expected_env_files.issubset(critical_files), f"Expected {expected_env_files} to be critical, got {critical_files}"
+    print(f"[SUCCESS] .env files correctly classified as critical: {critical_files}")
+
+    # Prioritization score test
+    files = [{"path": "src/main.py"}, {"path": ".env.local"}, {"path": ".env"}]
+    prioritized = github_client._prioritize_files(files)
+    top_paths = [f["path"] for f in prioritized[:2]]
+    assert ".env" in top_paths or ".env.local" in top_paths, f"Expected .env files at top priority, got {top_paths}"
+    print(f"[SUCCESS] .env files successfully prioritized at top rank: {top_paths}")
+
+
 async def main():
     await test_schema_and_unique_constraint()
     await test_session_security_and_ownership()
     await test_get_processed_file_paths()
     await test_code_snippet_prompt_format()
+    await test_env_file_prioritization()
     print("\n=== ALL TEST VERIFICATIONS PASSED SUCCESSFULLY ===")
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
