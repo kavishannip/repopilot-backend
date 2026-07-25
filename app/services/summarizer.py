@@ -635,6 +635,9 @@ class RepoSummarizer:
 
     # Version control / project markers
     ".gitmodules",
+
+    # Environment / configuration
+    ".env", ".env.*", ".env-*",
 }
         manifest_files = []
         for f in classification["critical"]:
