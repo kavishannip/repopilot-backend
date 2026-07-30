@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     supabase_key: str = ""
 
     # ── Analysis tuning ──────────────────────────────────────
+    enable_graph_analysis: bool = True   # Set to False via env ENABLE_GRAPH_ANALYSIS=false to disable graphs
     max_file_content_chars: int = 8000   # per-file read cap for critical files
     max_repo_size_kb: int = 100 * 1024   # 100 MB repo size cap
     analysis_timeout_seconds: int = 600  # 10 min total timeout
