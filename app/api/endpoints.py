@@ -2,8 +2,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import re
 import asyncio
+import json
 import logging
 from typing import Optional, List
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.database import async_session
 from sqlalchemy.future import select
@@ -73,25 +75,15 @@ class JobStatusResponse(BaseModel):
     updated_at: Optional[str] = None
 
 
-class GraphNodeResponse(BaseModel):
-    id: str
-    path: str
-    type: str
-    deep_analysis: bool
-    data: Optional[dict] = None
+class ArchitectureDiagramRequest(BaseModel):
+    repo_id: str
+    force_regenerate: bool = False
 
-class GraphEdgeResponse(BaseModel):
-    id: str
-    source: str
-    target: str
-    source_node_id: Optional[str] = None
-    target_node_id: Optional[str] = None
-    type: str
-    label: Optional[str] = None
 
-class GraphDataResponse(BaseModel):
-    nodes: List[GraphNodeResponse]
-    edges: List[GraphEdgeResponse]
+class ArchitectureDiagramResponse(BaseModel):
+    mermaid_code: str
+    diagram_type: str
+    cached: bool = False
 
 
 def is_valid_github_url(url: str) -> bool:
@@ -375,57 +367,173 @@ async def get_job_status(job_id: str):
     )
 
 
-@router.get("/graph", response_model=GraphDataResponse)
-async def get_graph_data(repo_url: str):
+@router.post("/architecture-diagram", response_model=ArchitectureDiagramResponse)
+async def generate_architecture_diagram(req: ArchitectureDiagramRequest):
     """
-    Fetch raw graph data (nodes and edges) for frontend visualization.
+    Generate a high-level Mermaid architecture diagram for a repository.
+    Sends analysis brief data to LLM, returns valid Mermaid syntax.
+    Result is cached in Repository.brief JSONB under 'architecture_diagram'.
     """
-    repo_url = repo_url.rstrip("/")
-    if not is_valid_github_url(repo_url):
-        raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
-
     async with async_session() as session:
-        # Get repository
-        stmt = select(Repository).where(Repository.repo_url == repo_url)
-        repo_obj = (await session.execute(stmt)).scalar_one_or_none()
+        stmt = select(Repository).where(Repository.id == req.repo_id)
+        try:
+            result = await session.execute(stmt)
+            repo_obj = result.scalar_one_or_none()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Repository ID format.")
+
         if not repo_obj:
-            raise HTTPException(status_code=404, detail="Repository not found or hasn't been analyzed yet.")
-            
-        from app.models.schema import GraphNode, GraphEdge
-        
-        # Get nodes
-        nodes_stmt = select(GraphNode).where(GraphNode.repository_id == repo_obj.id)
-        nodes = (await session.execute(nodes_stmt)).scalars().all()
-        
-        # Get edges
-        edges_stmt = select(GraphEdge).where(GraphEdge.repository_id == repo_obj.id)
-        edges = (await session.execute(edges_stmt)).scalars().all()
-        
-    return GraphDataResponse(
-        nodes=[
-            GraphNodeResponse(
-                id=str(n.id), 
-                path=n.path, 
-                type=n.type, 
-                deep_analysis=n.deep_analysis,
-                data={
-                    "label": n.path.split("/")[-1] if n.path else str(n.id),
-                    "path": n.path,
-                    "type": n.type,
-                    "deep_analysis": n.deep_analysis
-                }
-            ) for n in nodes
-        ],
-        edges=[
-            GraphEdgeResponse(
-                id=str(e.id), 
-                source=str(e.source_node_id),
-                target=str(e.target_node_id),
-                source_node_id=str(e.source_node_id), 
-                target_node_id=str(e.target_node_id), 
-                type=e.type,
-                label=e.type
-            ) for e in edges
-        ]
+            raise HTTPException(status_code=404, detail="Repository not found. Run deep analysis first.")
+        if not repo_obj.brief:
+            raise HTTPException(status_code=404, detail="No analysis data found. Run deep analysis first.")
+
+        brief_data: dict = repo_obj.brief
+
+        # Return cached diagram if available
+        cached_diagram = brief_data.get("architecture_diagram")
+        if cached_diagram and isinstance(cached_diagram, dict) and cached_diagram.get("mermaid_code") and not req.force_regenerate:
+            return ArchitectureDiagramResponse(
+                mermaid_code=cached_diagram["mermaid_code"],
+                diagram_type=cached_diagram.get("diagram_type", "graph"),
+                cached=True,
+            )
+
+    # Build context from brief fields
+    architecture_summary = brief_data.get("architecture_summary", "")
+    data_flow = brief_data.get("data_flow", "")
+    directory_structure = brief_data.get("directory_structure", "")
+    summary = brief_data.get("summary", "")
+
+    # Format components
+    components = brief_data.get("components", [])
+    components_text = ""
+    if components:
+        parts = []
+        for c in components:
+            name = c.get("name", "")
+            desc = c.get("description", "")
+            depends = ", ".join(c.get("depends_on", []))
+            techs = ", ".join(c.get("technologies", []))
+            parts.append(f"- {name}: {desc} | depends_on: [{depends}] | technologies: [{techs}]")
+        components_text = "\n".join(parts)
+
+    # Format tech stack
+    tech_stack = brief_data.get("tech_stack", [])
+    tech_text = ""
+    if tech_stack:
+        parts = [f"- {t.get('name', '')} ({t.get('category', '')}): {t.get('purpose', '')}" for t in tech_stack]
+        tech_text = "\n".join(parts)
+
+    # Format dependency graph
+    dep_graph = brief_data.get("dependency_graph", {})
+    dep_text = ""
+    if dep_graph:
+        parts = [f"- {src} -> [{', '.join(targets)}]" for src, targets in dep_graph.items()]
+        dep_text = "\n".join(parts)
+
+    detected_patterns = brief_data.get("detected_patterns", [])
+    patterns_text = ", ".join(detected_patterns) if detected_patterns else "Not detected"
+
+    system_prompt = """You are an expert software architect specializing in system visualization.
+Your task: generate a high-level Mermaid.js architecture diagram of a software repository.
+
+RULES:
+1. Use the Mermaid graph syntax. You may choose `graph TD` (top-down) or `graph LR` (left-right) — pick whichever best fits the architecture shape.
+2. Show ONLY core architecture and major services. Keep it ultra-simple and highly readable. Hide minor components.
+3. Maximum 12 nodes. Aim for 5-10 nodes for maximum simplicity.
+4. Group related nodes using `subgraph` blocks (e.g., subgraph Frontend, subgraph Backend, subgraph External).
+5. Add context to node labels using HTML line breaks (`<br/>`). Example: `DB["Database<br/>(Stores user profiles)"]`. This adds detail without cluttering.
+6. Use accurate edge labels derived ONLY from the provided context (e.g., if it's MongoDB, don't label the edge SQL). If the protocol is unknown, use generic terms like "calls" or "data".
+7. CRITICAL: Do NOT hallucinate technologies. Base all nodes, edge protocols, and database types EXACTLY on the 'TECH STACK' and 'DATA AND REQUEST FLOW' sections below.
+8. Apply node styling using `:::` class notation or inline `style` for node types:
+   - Frontend nodes: style with fill:#312e81,stroke:#6366f1 (indigo)
+   - Backend/API nodes: style with fill:#1e3a5f,stroke:#3b82f6 (blue)  
+   - Database nodes: style with fill:#14532d,stroke:#22c55e (green)
+   - External service nodes: style with fill:#7c2d12,stroke:#f97316 (orange)
+   - Auth/Security nodes: style with fill:#4a1d96,stroke:#a855f7 (purple)
+9. RETURN ONLY the Mermaid code — no markdown fences, no explanation, no commentary.
+10. The output must be syntactically valid Mermaid that can be rendered directly.
+11. Do not use parentheses inside node labels — use brackets [] or quotes only.
+12. CRITICAL: For directed edges with labels, use EXACTLY this syntax: `Node1 -->|Label| Node2`. DO NOT use `|>` in arrows (e.g. `-->|Label|>` is INVALID)."""
+
+    user_prompt = f"""Generate a Mermaid architecture diagram for this repository.
+
+=== PROJECT OVERVIEW ===
+{summary[:2000]}
+
+=== SYSTEM ARCHITECTURE ===
+{architecture_summary[:3000]}
+
+=== DATA AND REQUEST FLOW ===
+{data_flow[:2000]}
+
+=== COMPONENTS ===
+{components_text[:2000]}
+
+=== COMPONENT DEPENDENCIES ===
+{dep_text[:1000]}
+
+=== TECH STACK ===
+{tech_text[:1500]}
+
+=== DETECTED PATTERNS ===
+{patterns_text}
+
+=== DIRECTORY STRUCTURE (top level) ===
+{directory_structure[:1500]}
+
+Now produce the Mermaid diagram code only:"""
+
+    try:
+        from app.services.llm import get_fast_llm
+        llm = get_fast_llm()
+        response = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        mermaid_raw = response.content.strip()
+    except Exception as e:
+        logger.exception("Failed to generate architecture diagram via LLM")
+        raise HTTPException(status_code=500, detail=f"LLM diagram generation failed: {e}")
+
+    # Strip any accidental markdown fences
+    mermaid_code = re.sub(r'^```[a-zA-Z]*\n?', '', mermaid_raw, flags=re.MULTILINE)
+    mermaid_code = re.sub(r'```$', '', mermaid_code, flags=re.MULTILINE).strip()
+
+    # Sanitize invalid arrow syntax (e.g., -->|HTTP|> becomes -->|HTTP|)
+    mermaid_code = re.sub(r'(-->\|[^|]+\|)>', r'\1 ', mermaid_code)
+    mermaid_code = re.sub(r'(->\|[^|]+\|)>', r'\1 ', mermaid_code)
+
+    # Detect diagram type from first line
+    first_line = mermaid_code.split("\n")[0].strip().lower()
+    if first_line.startswith("graph"):
+        diagram_type = "graph"
+    elif first_line.startswith("flowchart"):
+        diagram_type = "flowchart"
+    elif first_line.startswith("sequencediagram"):
+        diagram_type = "sequence"
+    elif first_line.startswith("c4"):
+        diagram_type = "c4"
+    else:
+        diagram_type = "graph"
+
+    # Cache result in Repository.brief JSONB
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.id == req.repo_id)
+        result = await session.execute(stmt)
+        repo_obj = result.scalar_one_or_none()
+        if repo_obj and repo_obj.brief:
+            updated_brief = dict(repo_obj.brief)
+            updated_brief["architecture_diagram"] = {
+                "mermaid_code": mermaid_code,
+                "diagram_type": diagram_type,
+            }
+            repo_obj.brief = updated_brief
+            await session.commit()
+
+    return ArchitectureDiagramResponse(
+        mermaid_code=mermaid_code,
+        diagram_type=diagram_type,
+        cached=False,
     )
 
