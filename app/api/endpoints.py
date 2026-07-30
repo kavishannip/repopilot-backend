@@ -32,6 +32,23 @@ class QuickSummaryResponse(BaseModel):
     metadata: dict
     cached: bool = False
     cached_brief: Optional[RepoBrief] = None
+    commit_sha: Optional[str] = None
+
+
+class CheckUpdateRequest(BaseModel):
+    repo_url: str
+
+
+class CheckUpdateResponse(BaseModel):
+    is_stale: bool
+    cached_sha: Optional[str] = None
+    latest_sha: Optional[str] = None
+    changed_files_count: int = 0
+    diff_summary: Optional[dict] = None
+
+
+class SyncRequest(BaseModel):
+    repo_id: str
 
 
 class AnalyzeResponse(BaseModel):
@@ -145,7 +162,8 @@ async def get_quick_summary(req: QuickSummaryRequest):
                 summary=repo_obj.quick_summary,
                 metadata=meta,
                 cached=True,
-                cached_brief=cached_brief_obj
+                cached_brief=cached_brief_obj,
+                commit_sha=repo_obj.commit_sha
             )
 
     # Generate summary
@@ -179,13 +197,77 @@ async def get_quick_summary(req: QuickSummaryRequest):
         await session.commit()
         await session.refresh(repo_obj)
         repo_id_str = str(repo_obj.id)
+        current_sha = repo_obj.commit_sha
 
     return QuickSummaryResponse(
         repo_id=repo_id_str,
         repo_url=repo_url,
         summary=summary_text,
         metadata=meta,
-        cached=False
+        cached=False,
+        commit_sha=current_sha
+    )
+
+
+async def _run_sync_pipeline(job_id: str, repo_url: str) -> None:
+    """
+    Background task: runs incremental sync pipeline + re-synthesizes brief.
+    """
+    try:
+        brief = await summarizer.sync_and_regenerate_brief(repo_url, job_id=job_id)
+        await job_manager.complete_job(job_id, brief.model_dump())
+    except Exception as e:
+        logger.exception(f"[Job {job_id[:8]}] sync pipeline error")
+        await job_manager.fail_job(job_id, str(e))
+
+
+@router.post("/check-update", response_model=CheckUpdateResponse)
+async def check_repo_update(req: CheckUpdateRequest):
+    """
+    Lightweight check if a repository has newer commits on GitHub than what's cached.
+    """
+    repo_url = req.repo_url.rstrip("/")
+    if not is_valid_github_url(repo_url):
+        raise HTTPException(status_code=400, detail="Invalid GitHub URL.")
+
+    try:
+        res = await summarizer.pipeline.check_staleness(repo_url)
+        return CheckUpdateResponse(
+            is_stale=res["is_stale"],
+            cached_sha=res["cached_sha"],
+            latest_sha=res["latest_sha"],
+            changed_files_count=res["changed_files_count"],
+            diff_summary=res["diff_summary"],
+        )
+    except Exception as e:
+        logger.exception(f"Failed to check updates for {repo_url}")
+        raise HTTPException(status_code=500, detail=f"Failed to check updates: {e}")
+
+
+@router.post("/sync", response_model=JobSubmitResponse)
+async def sync_repo(req: SyncRequest):
+    """
+    Trigger incremental sync for a repository that has updated on GitHub.
+    """
+    repo_url = None
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.id == req.repo_id)
+        try:
+            result = await session.execute(stmt)
+            repo_obj = result.scalar_one_or_none()
+            if not repo_obj:
+                raise HTTPException(status_code=404, detail="Repository ID not found.")
+            repo_url = repo_obj.repo_url
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Repository ID format.")
+
+    job_id = await job_manager.create_job(repo_url)
+    asyncio.create_task(_run_sync_pipeline(job_id, repo_url))
+
+    return JobSubmitResponse(
+        job_id=job_id,
+        status="pending",
+        message="Incremental synchronization started. Poll status for updates.",
     )
 
 

@@ -133,26 +133,30 @@ class ProcessingPipeline:
         selected_paths = {f["path"] for f in selected_files}
 
         # --- Structural Scan ---
-        print("Running full-repo structural scan...")
-        from app.services.structural_scanner import StructuralScanner
-        scanner = StructuralScanner()
-        scan_files = [
-            f for f in all_files 
-            if f.get("type", "file") in ("file", "blob") and f["path"].endswith((
-                ".py", ".ts", ".tsx", ".js", ".jsx", 
-                ".go", ".java", ".kt", ".rs", ".c", ".cpp", ".h", ".hpp", 
-                ".cs", ".rb", ".php", ".swift", ".m"
-            ))
-        ]
-        
-        scan_contents = await self.github.get_files_content_batch(
-            repo_url,
-            [f["path"] for f in scan_files[:3000]],
-            branch=branch,
-            max_chars_per_file=50_000,
-        )
-        
-        nodes, edges = scanner.scan(repo_id, all_files, scan_contents, selected_paths)
+        nodes, edges = [], []
+        if settings.enable_graph_analysis:
+            print("Running full-repo structural scan...")
+            from app.services.structural_scanner import StructuralScanner
+            scanner = StructuralScanner()
+            scan_files = [
+                f for f in all_files 
+                if f.get("type", "file") in ("file", "blob") and f["path"].endswith((
+                    ".py", ".ts", ".tsx", ".js", ".jsx", 
+                    ".go", ".java", ".kt", ".rs", ".c", ".cpp", ".h", ".hpp", 
+                    ".cs", ".rb", ".php", ".swift", ".m"
+                ))
+            ]
+            
+            scan_contents = await self.github.get_files_content_batch(
+                repo_url,
+                [f["path"] for f in scan_files[:3000]],
+                branch=branch,
+                max_chars_per_file=50_000,
+            )
+            
+            nodes, edges = scanner.scan(repo_id, all_files, scan_contents, selected_paths)
+        else:
+            print("Full-repo structural scan SKIPPED (enable_graph_analysis=False)")
 
         print(f"Processing {len(selected_files)} selected files for deep embedding...")
         all_chunks = []
@@ -237,6 +241,95 @@ class ProcessingPipeline:
             stmt = select(distinct(RepoChunk.file_path)).where(RepoChunk.repository_id == repository_id)
             res = await session.execute(stmt)
             return set(res.scalars().all())
+
+    async def check_staleness(self, repo_url: str) -> Dict[str, Any]:
+        """
+        Check if repository in DB has newer commits on GitHub without performing sync.
+        Compares both commit_sha and repo pushed_at timestamp against DB updated_at.
+        """
+        async with async_session() as session:
+            stmt = select(Repository).where(Repository.repo_url == repo_url)
+            repo_obj = (await session.execute(stmt)).scalar_one_or_none()
+            if not repo_obj or not repo_obj.commit_sha:
+                return {
+                    "is_stale": False,
+                    "cached_sha": None,
+                    "latest_sha": None,
+                    "changed_files_count": 0,
+                    "diff_summary": None,
+                }
+
+            branch = repo_obj.default_branch or "main"
+            try:
+                latest_sha = await self._get_branch_commit(repo_url, branch)
+                meta = await self.github.get_repo_metadata(repo_url)
+                pushed_at_str = meta.get("pushed_at")
+            except Exception as e:
+                logger.warning(f"Failed to fetch branch commit for staleness check: {e}")
+                return {
+                    "is_stale": False,
+                    "cached_sha": repo_obj.commit_sha,
+                    "latest_sha": repo_obj.commit_sha,
+                    "changed_files_count": 0,
+                    "diff_summary": None,
+                }
+
+            # 1. SHA Match Check
+            if repo_obj.commit_sha == latest_sha:
+                return {
+                    "is_stale": False,
+                    "cached_sha": repo_obj.commit_sha,
+                    "latest_sha": latest_sha,
+                    "changed_files_count": 0,
+                    "diff_summary": None,
+                }
+
+            # 2. Timestamp Comparison: If last analysis time >= GitHub pushed_at, repo is up to date
+            if repo_obj.updated_at and pushed_at_str:
+                from datetime import datetime, timezone
+                try:
+                    pushed_dt = datetime.fromisoformat(pushed_at_str.replace("Z", "+00:00"))
+                    updated_dt = repo_obj.updated_at
+                    if updated_dt.tzinfo is None:
+                        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+                    
+                    if updated_dt >= pushed_dt:
+                        return {
+                            "is_stale": False,
+                            "cached_sha": repo_obj.commit_sha,
+                            "latest_sha": latest_sha,
+                            "changed_files_count": 0,
+                            "diff_summary": None,
+                        }
+                except Exception as ex:
+                    logger.warning(f"Error parsing pushed_at timestamp: {ex}")
+
+            is_stale = True
+            diff_summary = None
+            changed_count = 0
+
+            try:
+                diff = await self.github.get_commit_diff(repo_url, repo_obj.commit_sha, latest_sha)
+                added_cnt = len(diff.get("added", []))
+                modified_cnt = len(diff.get("modified", []))
+                removed_cnt = len(diff.get("removed", []))
+                changed_count = added_cnt + modified_cnt + removed_cnt
+                diff_summary = {
+                    "added": added_cnt,
+                    "modified": modified_cnt,
+                    "removed": removed_cnt,
+                }
+            except Exception as e:
+                logger.warning(f"Failed to fetch commit diff for staleness check: {e}")
+                changed_count = -1
+
+            return {
+                "is_stale": is_stale,
+                "cached_sha": repo_obj.commit_sha,
+                "latest_sha": latest_sha,
+                "changed_files_count": changed_count,
+                "diff_summary": diff_summary,
+            }
 
     async def check_and_sync_commit(self, repo_url: str, force: bool = False) -> bool:
         """
