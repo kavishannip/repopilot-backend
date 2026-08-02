@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Header, Query
+from fastapi import APIRouter, HTTPException, Header, Query, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 import uuid
@@ -8,6 +8,7 @@ from sqlalchemy.future import select
 from app.database import async_session
 from app.models.schema import Repository, ChatSession, ChatMessage
 from app.services.chat_service import RepoChatService
+from app.auth import verify_jwt
 
 router = APIRouter()
 chat_service = RepoChatService()
@@ -70,12 +71,13 @@ def get_effective_client_id(header_id: Optional[str], body_id: Optional[str], pa
 async def create_chat_session(
     req: CreateSessionRequest,
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID"),
+    user: dict = Depends(verify_jwt),
 ):
     """
     Create a new chat session for a repository.
-    Enforces mandatory client_id ownership (auto-generated if missing).
+    Enforces mandatory client_id ownership (scoped to Asgardeo user).
     """
-    effective_client_id = get_effective_client_id(x_client_id, req.client_id)
+    effective_client_id = user.get("sub") or get_effective_client_id(x_client_id, req.client_id)
 
     try:
         repo_uuid = uuid.UUID(req.repo_id)
@@ -110,12 +112,13 @@ async def create_chat_session(
 async def send_chat_message(
     req: SendMessageRequest,
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID"),
+    user: dict = Depends(verify_jwt),
 ):
     """
     Send a question to a chat session.
     Runs query condensation, vector search, reasoning LLM synthesis, and 1-pass fallback file scan if needed.
     """
-    effective_client_id = get_effective_client_id(x_client_id, req.client_id)
+    effective_client_id = user.get("sub") or get_effective_client_id(x_client_id, req.client_id)
     user_query = req.question or req.message
     if not user_query:
         raise HTTPException(status_code=400, detail="Field 'question' or 'message' is required.")
@@ -141,11 +144,12 @@ async def get_session_history(
     session_id: str,
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID"),
     client_id: Optional[str] = Query(None),
+    user: dict = Depends(verify_jwt),
 ):
     """
     Retrieve message history for a session. Validates client ownership.
     """
-    effective_client_id = x_client_id or client_id
+    effective_client_id = user.get("sub") or x_client_id or client_id
     if not effective_client_id:
         raise HTTPException(status_code=400, detail="Missing X-Client-ID header or client_id query param.")
 
@@ -192,11 +196,12 @@ async def delete_chat_session(
     session_id: str,
     x_client_id: Optional[str] = Header(None, alias="X-Client-ID"),
     client_id: Optional[str] = Query(None),
+    user: dict = Depends(verify_jwt),
 ):
     """
     Delete a chat session and all its message history. Validates client ownership.
     """
-    effective_client_id = x_client_id or client_id
+    effective_client_id = user.get("sub") or x_client_id or client_id
     if not effective_client_id:
         raise HTTPException(status_code=400, detail="Missing X-Client-ID header or client_id query param.")
 
