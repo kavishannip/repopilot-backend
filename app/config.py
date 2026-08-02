@@ -52,7 +52,17 @@ class Settings(BaseSettings):
     max_repo_size_kb: int = 100 * 1024   # 100 MB repo size cap
     analysis_timeout_seconds: int = 600  # 10 min total timeout
     max_source_file_chars: int = 200_000  # per-file cap when chunking selected source files
-    repo_cache_expire_days: int = 30     # How many days before repo data cache expires and is deleted from DB
+    # ── Asgardeo Auth ─────────────────────────────────────────
+    asgardeo_org_name: str = ""
+    asgardeo_client_id: str = ""
+
+    @property
+    def asgardeo_issuer(self) -> str:
+        return f"https://api.asgardeo.io/t/{self.asgardeo_org_name}/oauth2/token"
+
+    @property
+    def asgardeo_jwks_url(self) -> str:
+        return f"https://api.asgardeo.io/t/{self.asgardeo_org_name}/oauth2/jwks"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
