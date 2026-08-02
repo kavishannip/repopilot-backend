@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 import re
 import asyncio
@@ -15,6 +15,7 @@ from app.models.brief import RepoBrief
 from app.services.github_client import RepoSizeExceededError, RepoTooComplexError
 from app.services.job_manager import job_manager
 from app.config import settings
+from app.auth import verify_jwt
 
 router = APIRouter()
 summarizer = RepoSummarizer()
@@ -108,7 +109,7 @@ async def _run_pipeline(job_id: str, repo_url: str) -> None:
 
 
 @router.post("/quicksummary", response_model=QuickSummaryResponse)
-async def get_quick_summary(req: QuickSummaryRequest):
+async def get_quick_summary(req: QuickSummaryRequest, user: dict = Depends(verify_jwt)):
     """
     Generate a rapid summary of the repository using only metadata and key files.
     Creates the repository in the database if it doesn't exist and returns the repo_id.
@@ -214,7 +215,7 @@ async def _run_sync_pipeline(job_id: str, repo_url: str) -> None:
 
 
 @router.post("/check-update", response_model=CheckUpdateResponse)
-async def check_repo_update(req: CheckUpdateRequest):
+async def check_repo_update(req: CheckUpdateRequest, user: dict = Depends(verify_jwt)):
     """
     Lightweight check if a repository has newer commits on GitHub than what's cached.
     """
@@ -237,7 +238,7 @@ async def check_repo_update(req: CheckUpdateRequest):
 
 
 @router.post("/sync", response_model=JobSubmitResponse)
-async def sync_repo(req: SyncRequest):
+async def sync_repo(req: SyncRequest, user: dict = Depends(verify_jwt)):
     """
     Trigger incremental sync for a repository that has updated on GitHub.
     """
@@ -264,7 +265,7 @@ async def sync_repo(req: SyncRequest):
 
 
 @router.post("/analyze", response_model=JobSubmitResponse)
-async def analyze_repo(req: AnalyzeRequest):
+async def analyze_repo(req: AnalyzeRequest, user: dict = Depends(verify_jwt)):
     """
     Submit a repo for analysis. Returns a job_id immediately.
     Poll GET /status/{job_id} for progress and result.
@@ -341,7 +342,7 @@ async def analyze_repo(req: AnalyzeRequest):
 
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
+async def get_job_status(job_id: str, user: dict = Depends(verify_jwt)):
     """
     Poll analysis job status. Returns phase progress and final result when done.
     """
@@ -368,7 +369,7 @@ async def get_job_status(job_id: str):
 
 
 @router.post("/architecture-diagram", response_model=ArchitectureDiagramResponse)
-async def generate_architecture_diagram(req: ArchitectureDiagramRequest):
+async def generate_architecture_diagram(req: ArchitectureDiagramRequest, user: dict = Depends(verify_jwt)):
     """
     Generate a high-level Mermaid architecture diagram for a repository.
     Sends analysis brief data to LLM, returns valid Mermaid syntax.

@@ -58,8 +58,7 @@ async def verify_jwt(credentials: HTTPAuthorizationCredentials = Security(securi
             token,
             key=public_key,
             algorithms=["RS256"],
-            audience=settings.asgardeo_client_id,
-            issuer=settings.asgardeo_issuer,
+            options={"verify_aud": False, "verify_iss": False},
         )
         return payload
     except jwt.ExpiredSignatureError:
