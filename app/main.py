@@ -1,14 +1,27 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from app.api.endpoints import router as analyzer_router
 from app.api.chat_endpoints import router as chat_router
+from app.database import engine
+from app.models.schema import Base
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
 
 app = FastAPI(
     title="RepoPilot API",
     description="Repo analyzer backend",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan,
 )
+
 
 # Enable CORS for frontend client
 app.add_middleware(
