@@ -191,6 +191,52 @@ async def get_session_history(
         )
 
 
+class ChatSessionItemResponse(BaseModel):
+    id: str
+    repo_id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+
+@router.get("/sessions", response_model=List[ChatSessionItemResponse])
+async def list_chat_sessions(
+    repo_id: Optional[str] = Query(None),
+    x_client_id: Optional[str] = Header(None, alias="X-Client-ID"),
+    user: dict = Depends(verify_jwt),
+):
+    """
+    List all chat sessions owned by the authenticated user, optionally filtered by repo_id.
+    """
+    effective_client_id = user.get("sub") or x_client_id
+    if not effective_client_id:
+        raise HTTPException(status_code=400, detail="Authentication required")
+
+    async with async_session() as session:
+        stmt = select(ChatSession).where(ChatSession.user_id == effective_client_id)
+        if repo_id:
+            try:
+                repo_uuid = uuid.UUID(repo_id)
+                stmt = stmt.where(ChatSession.repository_id == repo_uuid)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid Repository ID format.")
+
+        stmt = stmt.order_by(ChatSession.updated_at.desc())
+        result = await session.execute(stmt)
+        sessions = result.scalars().all()
+
+        return [
+            ChatSessionItemResponse(
+                id=str(s.id),
+                repo_id=str(s.repository_id),
+                title=s.title,
+                created_at=s.created_at.isoformat(),
+                updated_at=s.updated_at.isoformat() if s.updated_at else s.created_at.isoformat(),
+            )
+            for s in sessions
+        ]
+
+
 @router.delete("/session/{session_id}")
 async def delete_chat_session(
     session_id: str,
@@ -223,3 +269,4 @@ async def delete_chat_session(
         await session.commit()
 
     return {"status": "deleted", "session_id": session_id}
+

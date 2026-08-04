@@ -9,13 +9,14 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from app.database import async_session
 from sqlalchemy.future import select
-from app.models.schema import Repository
+from app.models.schema import Repository, UserRepository
 from app.services.summarizer import RepoSummarizer
 from app.models.brief import RepoBrief
 from app.services.github_client import RepoSizeExceededError, RepoTooComplexError
 from app.services.job_manager import job_manager
 from app.config import settings
 from app.auth import verify_jwt
+
 
 router = APIRouter()
 summarizer = RepoSummarizer()
@@ -87,7 +88,49 @@ class ArchitectureDiagramResponse(BaseModel):
     cached: bool = False
 
 
+class RepositoryItemResponse(BaseModel):
+    id: str
+    repo_url: str
+    owner: str
+    name: str
+    language: Optional[str] = None
+    stars: Optional[int] = 0
+    description: Optional[str] = None
+    has_quick_summary: bool = False
+    has_deep_analysis: bool = False
+    updated_at: Optional[str] = None
+
+
+class RepositoryDetailsResponse(BaseModel):
+    id: str
+    repo_url: str
+    owner: str
+    name: str
+    quick_summary: Optional[str] = None
+    metadata: Optional[dict] = None
+    brief: Optional[RepoBrief] = None
+    commit_sha: Optional[str] = None
+
+
+async def _link_user_repo(session, user_id: Optional[str], repo_id):
+    """
+    Associate a user_id (Asgardeo sub) with a repository ID in user_repositories table.
+    """
+    if not user_id or not repo_id:
+        return
+    stmt = select(UserRepository).where(
+        UserRepository.user_id == user_id,
+        UserRepository.repository_id == repo_id
+    )
+    result = await session.execute(stmt)
+    if not result.scalar_one_or_none():
+        user_repo = UserRepository(user_id=user_id, repository_id=repo_id)
+        session.add(user_repo)
+        await session.commit()
+
+
 def is_valid_github_url(url: str) -> bool:
+
     pattern = r"^https://github\.com/[\w-]+/[\w.-]+/?$"
     return bool(re.match(pattern, url))
 
@@ -141,7 +184,8 @@ async def get_quick_summary(req: QuickSummaryRequest, user: dict = Depends(verif
         repo_obj = result.scalar_one_or_none()
 
         if repo_obj and repo_obj.quick_summary:
-            # Cache hit
+            # Cache hit — ensure repo is linked to user
+            await _link_user_repo(session, user.get("sub"), repo_obj.id)
             cached_brief_obj = None
             if repo_obj.brief:
                 try:
@@ -189,8 +233,10 @@ async def get_quick_summary(req: QuickSummaryRequest, user: dict = Depends(verif
 
         await session.commit()
         await session.refresh(repo_obj)
+        await _link_user_repo(session, user.get("sub"), repo_obj.id)
         repo_id_str = str(repo_obj.id)
         current_sha = repo_obj.commit_sha
+
 
     return QuickSummaryResponse(
         repo_id=repo_id_str,
@@ -455,7 +501,9 @@ RULES:
 9. RETURN ONLY the Mermaid code — no markdown fences, no explanation, no commentary.
 10. The output must be syntactically valid Mermaid that can be rendered directly.
 11. Do not use parentheses inside node labels — use brackets [] or quotes only.
-12. CRITICAL: For directed edges with labels, use EXACTLY this syntax: `Node1 -->|Label| Node2`. DO NOT use `|>` in arrows (e.g. `-->|Label|>` is INVALID)."""
+12. CRITICAL: For directed edges with labels, use EXACTLY this syntax: `Node1 -->|Label| Node2`. DO NOT use `|>` in arrows (e.g. `-->|Label|>` is INVALID).
+13. CRITICAL: Node IDs must NEVER be identical to subgraph names (e.g. DO NOT put a node named 'Backend' inside 'subgraph Backend'). Use distinct node IDs such as 'backend_api["Backend API"]' or 'fe_app["Frontend UI"]'."""
+
 
     user_prompt = f"""Generate a Mermaid architecture diagram for this repository.
 
@@ -530,7 +578,18 @@ Now produce the Mermaid diagram code only:"""
     mermaid_code = re.sub(r'(-->\|[^|]+\|)>', r'\1 ', mermaid_code)
     mermaid_code = re.sub(r'(->\|[^|]+\|)>', r'\1 ', mermaid_code)
 
+    # Prevent Dagre 'Setting X as parent of X would create a cycle' error
+    subgraph_names = set(re.findall(r'subgraph\s+["\']?([A-Za-z0-9_]+)["\']?', mermaid_code))
+    for sg in subgraph_names:
+        pattern_def = r'\b' + re.escape(sg) + r'\b\s*(\[[^\]]+\]|\([^)]+\)|\{[^}]+\})'
+        if re.search(pattern_def, mermaid_code):
+            node_alias = f"{sg}_Node"
+            mermaid_code = re.sub(r'\b' + re.escape(sg) + r'\b(?=\s*(\[[^\]]+\]|\([^)]+\)|\{[^}]+\}))', node_alias, mermaid_code)
+            mermaid_code = re.sub(r'\b' + re.escape(sg) + r'\b(?=\s*(-->|--|-\.))', node_alias, mermaid_code)
+            mermaid_code = re.sub(r'(-->|--|-\.)\s*(\|[^|]+\|)?\s*\b' + re.escape(sg) + r'\b', r'\1 \2 ' + node_alias, mermaid_code)
+
     # Detect diagram type from first line
+
     first_line = mermaid_code.split("\n")[0].strip().lower()
     if first_line.startswith("graph"):
         diagram_type = "graph"
@@ -562,4 +621,87 @@ Now produce the Mermaid diagram code only:"""
         diagram_type=diagram_type,
         cached=False,
     )
+
+
+@router.get("/repositories", response_model=List[RepositoryItemResponse])
+async def get_user_repositories(user: dict = Depends(verify_jwt)):
+    """
+    Get all repositories scanned by the authenticated user.
+    """
+    user_id = user.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user authentication payload")
+    
+    async with async_session() as session:
+        stmt = (
+            select(Repository)
+            .join(UserRepository, Repository.id == UserRepository.repository_id)
+            .where(UserRepository.user_id == user_id)
+            .order_by(UserRepository.scanned_at.desc())
+        )
+        result = await session.execute(stmt)
+        repos = result.scalars().all()
+        out = []
+        for r in repos:
+            out.append(
+                RepositoryItemResponse(
+                    id=str(r.id),
+                    repo_url=r.repo_url,
+                    owner=r.owner or "",
+                    name=r.name or "",
+                    language=r.language,
+                    stars=r.stars or 0,
+                    description=r.description,
+                    has_quick_summary=bool(r.quick_summary),
+                    has_deep_analysis=bool(r.brief),
+                    updated_at=r.updated_at.isoformat() if r.updated_at else None
+                )
+            )
+        return out
+
+
+@router.get("/repository/{repo_id}", response_model=RepositoryDetailsResponse)
+async def get_repository_details(repo_id: str, user: dict = Depends(verify_jwt)):
+    """
+    Fetch full repository state by repo_id (quick summary, brief, metadata).
+    """
+    async with async_session() as session:
+        stmt = select(Repository).where(Repository.id == repo_id)
+        try:
+            result = await session.execute(stmt)
+            repo_obj = result.scalar_one_or_none()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid Repository ID format.")
+
+        if not repo_obj:
+            raise HTTPException(status_code=404, detail="Repository not found.")
+
+        brief_parsed = None
+        if repo_obj.brief:
+            try:
+                brief_parsed = RepoBrief(**repo_obj.brief)
+            except Exception as e:
+                logger.warning(f"Failed to parse brief for repo {repo_id}: {e}")
+                brief_parsed = None
+
+        meta = {
+            "owner": repo_obj.owner or "",
+            "name": repo_obj.name or "",
+            "default_branch": repo_obj.default_branch or "main",
+            "language": repo_obj.language or "",
+            "stars": repo_obj.stars or 0,
+            "description": repo_obj.description or "",
+        }
+
+        return RepositoryDetailsResponse(
+            id=str(repo_obj.id),
+            repo_url=repo_obj.repo_url,
+            owner=repo_obj.owner or "",
+            name=repo_obj.name or "",
+            quick_summary=repo_obj.quick_summary,
+            metadata=meta,
+            brief=brief_parsed,
+            commit_sha=repo_obj.commit_sha
+        )
+
 
