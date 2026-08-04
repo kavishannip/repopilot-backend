@@ -126,7 +126,21 @@ class ChatMessage(Base):
     session = relationship("ChatSession", back_populates="messages")
 
 
+class UserRepository(Base):
+    """
+    Junction table associating a user_id (Asgardeo sub) with repositories they have scanned.
+    """
+    __tablename__ = "user_repositories"
+
+    user_id = Column(String, primary_key=True, index=True, nullable=False)
+    repository_id = Column(UUID(as_uuid=True), ForeignKey("repositories.id", ondelete="CASCADE"), primary_key=True, nullable=False)
+    scanned_at = Column(DateTime, default=datetime.utcnow)
+
+    repository = relationship("Repository")
+
+
 __all__ = [
     "Base", "Repository", "RepoChunk", "GraphNode", "GraphEdge", 
-    "AnalysisJob", "ChatSession", "ChatMessage"
+    "AnalysisJob", "ChatSession", "ChatMessage", "UserRepository"
 ]
+
