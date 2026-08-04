@@ -494,12 +494,37 @@ Now produce the Mermaid diagram code only:"""
         ])
         mermaid_raw = response.content.strip()
     except Exception as e:
-        logger.exception("Failed to generate architecture diagram via LLM")
-        raise HTTPException(status_code=500, detail=f"LLM diagram generation failed: {e}")
+        logger.exception("Failed to generate architecture diagram via LLM, using fallback builder")
+        # Build deterministic fallback Mermaid diagram from components and tech stack
+        fallback_lines = ["flowchart TD", "    subgraph Core System Architecture"]
+        components = brief_data.get("components", [])
+        tech_stack = brief_data.get("tech_stack", [])
+        if components:
+            for idx, comp in enumerate(components[:6]):
+                name = str(comp.get("name", f"Component {idx+1}")).replace('"', "'")
+                desc = str(comp.get("description", "")).replace('"', "'")[:40]
+                label = f"{name}<br/>({desc})" if desc else name
+                fallback_lines.append(f'        c{idx}["{label}"]')
+        else:
+            fallback_lines.append('        main["Application Core"]')
+        fallback_lines.append("    end")
+        if tech_stack:
+            fallback_lines.append("    subgraph Tech Stack")
+            for idx, tech in enumerate(tech_stack[:4]):
+                t_name = str(tech.get("name", f"Tech {idx+1}")).replace('"', "'")
+                fallback_lines.append(f'        t{idx}["{t_name}"]')
+                if components:
+                    fallback_lines.append(f"        c0 --> t{idx}")
+            fallback_lines.append("    end")
+        mermaid_raw = "\n".join(fallback_lines)
 
     # Strip any accidental markdown fences
     mermaid_code = re.sub(r'^```[a-zA-Z]*\n?', '', mermaid_raw, flags=re.MULTILINE)
     mermaid_code = re.sub(r'```$', '', mermaid_code, flags=re.MULTILINE).strip()
+
+    # Ensure diagram has a valid header
+    if not any(mermaid_code.strip().lower().startswith(h) for h in ["graph", "flowchart", "sequencediagram", "c4"]):
+        mermaid_code = f"flowchart TD\n{mermaid_code}"
 
     # Sanitize invalid arrow syntax (e.g., -->|HTTP|> becomes -->|HTTP|)
     mermaid_code = re.sub(r'(-->\|[^|]+\|)>', r'\1 ', mermaid_code)
