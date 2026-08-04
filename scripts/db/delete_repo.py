@@ -9,19 +9,26 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from sqlalchemy.future import select
 from sqlalchemy import delete
 from app.database import async_session
-from app.models.schema import Repository, AnalysisJob, RepoChunk, GraphNode, GraphEdge
+from app.models.schema import (
+    Repository, AnalysisJob, RepoChunk, GraphNode, GraphEdge,
+    ChatMessage, ChatSession, UserRepository
+)
 
 from sqlalchemy.exc import ProgrammingError
 
 async def delete_all():
     async with async_session() as session:
         models = [
+            ("ChatMessage", ChatMessage),
+            ("ChatSession", ChatSession),
+            ("UserRepository", UserRepository),
             ("AnalysisJob", AnalysisJob), 
             ("GraphEdge", GraphEdge), 
             ("GraphNode", GraphNode), 
             ("RepoChunk", RepoChunk), 
-            ("Repository", Repository)
+            ("Repository", Repository),
         ]
+
         
         for name, model in models:
             try:
